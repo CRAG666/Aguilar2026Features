@@ -153,6 +153,10 @@ from .pipeline import (
     preprocess_signals,
 )
 from .rng import make_rng
+from .significance import (
+    ComparisonRow,
+    compare_classifiers,
+)
 from .scoring import (
     compute_subject_centroids,
     cosine_score_matrix,
@@ -196,6 +200,7 @@ __all__ = [
     "CancelabilityReport",
     "ClassificationMetrics",
     "CmcCurve",
+    "ComparisonRow",
     "CrossValidationResult",
     "DEFAULT_BINARISE",
     "DEFAULT_ECG_CLEAN_METHOD",
@@ -246,6 +251,7 @@ __all__ = [
     "clean_ppg_batch",
     "closed_set_score_pools",
     "cmc_curve",
+    "compare_classifiers",
     "compute_subject_centroids",
     "cosine_score_matrix",
     "cross_validate_classifier_multiseed",

@@ -13,6 +13,7 @@ from pyeer.eer_stats import get_eer_values
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
+    balanced_accuracy_score,
     f1_score,
     precision_score,
     recall_score,
@@ -32,6 +33,9 @@ class ClassificationMetrics:
 
     Attributes:
         accuracy: Top-1 accuracy.
+        balanced_accuracy: Top-1 accuracy averaged per class (recall macro-mean).
+            Robust to unequal segments-per-subject, which plain accuracy is not;
+            report it alongside accuracy for the closed-set identification task.
         auc: Macro one-vs-rest ROC AUC.
         eer: Macro equal-error rate.
         precision: Macro precision (``zero_division=0``).
@@ -44,6 +48,7 @@ class ClassificationMetrics:
     """
 
     accuracy: float
+    balanced_accuracy: float
     auc: float
     eer: float
     precision: float
@@ -192,6 +197,7 @@ def evaluate(
     eer, n_total, n_evaluated = _macro_eer(y_true_bin, y_score)
     return ClassificationMetrics(
         accuracy=float(accuracy_score(y_true, y_pred)),
+        balanced_accuracy=float(balanced_accuracy_score(y_true, y_pred)),
         auc=_macro_auc(y_true_bin, y_score),
         eer=eer,
         precision=float(precision_score(

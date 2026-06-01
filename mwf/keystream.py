@@ -46,7 +46,11 @@ def keystream_rng(token: str) -> np.random.Generator:
     if not token:
         raise ValueError("Token must be a non-empty string.")
     digest = hashlib.sha256(token.encode("utf-8")).digest()
-    seed_words = np.frombuffer(digest, dtype=np.uint32)
+    # Explicit little-endian word order ('<u4') so the seed — and hence every
+    # projection matrix — is bit-for-bit identical on big- and little-endian
+    # hardware. Native byte order ('uint32') would silently diverge across
+    # architectures and break the reproducibility claim.
+    seed_words = np.frombuffer(digest, dtype="<u4")
     return np.random.default_rng(np.random.SeedSequence(seed_words.tolist()))
 
 

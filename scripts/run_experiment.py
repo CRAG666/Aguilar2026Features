@@ -22,9 +22,15 @@ Examples
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
+import os
+import subprocess
 import sys
 from dataclasses import asdict
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +52,7 @@ from mwf import (  # noqa: E402
     benchmark,
     build_templates,
     closed_set_score_pools,
+    compare_classifiers,
     cross_validate_classifier_multiseed,
     decidability,
     det_curve_from_scores,
@@ -59,6 +66,7 @@ from mwf import (  # noqa: E402
     make_pipeline,
     max_feature_level,
     multimodal_leakage_metrics,
+    nadeau_bengio_ci_mean,
     non_invertibility_analysis,
     per_subject_ablation,
     rank_k_accuracies,
@@ -70,10 +78,15 @@ from mwf import (  # noqa: E402
     set_global_seeds,
     stolen_token_score_pools,
     stolen_token_verification,
+    subject_holdout,
     summarise_run,
     temporal_holdout_per_subject,
 )
-from mwf.classifiers import CLASSIFIER_NAMES, build_classifier  # noqa: E402
+from mwf.classifiers import (  # noqa: E402
+    CLASSIFIER_NAMES,
+    build_classifier,
+    build_param_grid,
+)
 from mwf.feature_transform import (  # noqa: E402
     transform_multimodal,
     transform_multimodal_batch,
@@ -139,6 +152,53 @@ def _subset_segments(segments: BiometricSegments, max_subjects: int | None) -> B
     )
 
 
+def _git_sha() -> str | None:
+    """Return the current commit SHA, or ``None`` outside a git checkout."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=_PKG_ROOT, capture_output=True, text=True, check=True,
+        )
+        return out.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def _file_sha256(path: Path) -> str | None:
+    """Return the SHA-256 of ``path``, or ``None`` when it does not exist."""
+    if not path.exists():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_manifest(out: Path, args: argparse.Namespace, *, n_segments: int, n_subjects: int) -> None:
+    """Persist a provenance manifest so every results run is reproducible.
+
+    Records the git commit, full CLI args, dataset shape, key dependency versions
+    and the lockfile hash next to the CSVs — without this a ``metrics.csv`` cannot
+    be tied back to the exact code, environment and configuration that produced it.
+    """
+    deps: dict[str, str | None] = {}
+    for pkg in ("numpy", "scipy", "scikit-learn", "statsmodels", "pyeer", "neurokit2"):
+        try:
+            deps[pkg] = version(pkg)
+        except PackageNotFoundError:
+            deps[pkg] = None
+    manifest = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "git_sha": _git_sha(),
+        "python": sys.version,
+        "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
+        "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+        "dataset": {"n_segments": n_segments, "n_subjects": n_subjects},
+        "dependencies": deps,
+        "uv_lock_sha256": _file_sha256(_PKG_ROOT / "uv.lock"),
+    }
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    logger.info("Wrote provenance manifest to %s.", out / "run_manifest.json")
+
+
 def _save_csv(df: pd.DataFrame, path: Path) -> None:
     """Write ``df`` to ``path`` as CSV, skipping empty dataframes.
 
@@ -164,14 +224,23 @@ def _identification_and_verification(
     split_seeds: tuple[int, ...],
     run_identification: bool,
     run_verification: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    tune: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict[str, object]]]:
     """Sweep regimes × feature levels for identification and verification CV.
 
+    Args:
+        tune: When ``True``, each classifier is tuned with a group-aware inner CV
+            on every outer fold's train slice (nested CV) — removing the
+            selection-on-the-evaluation-data bias of fixed hyperparameters.
+
     Returns:
-        Tuple ``(identification_df, verification_df)``.
+        Tuple ``(identification_df, verification_df, id_results)``. ``id_results``
+        maps ``"{regime}@L{level}"`` → ``{classifier: CrossValidationResult}`` so
+        the paired significance tests can compare classifiers on identical folds.
     """
     id_rows: list[dict] = []
     ver_rows: list[dict] = []
+    id_results: dict[str, dict[str, object]] = {}
     for regime in regimes:
         for level in feature_levels:
             bundle = build_templates(
@@ -182,11 +251,15 @@ def _identification_and_verification(
                 key_mode=regime,
             )
             if run_identification:
+                group_key = f"{regime.value}@L{level}"
+                id_results[group_key] = {}
                 for name in CLASSIFIER_NAMES:
                     result = cross_validate_classifier_multiseed(
                         bundle, name, build_classifier(name),
                         n_folds=n_folds, split_seeds=split_seeds, ranks=RANK_TARGETS,
+                        param_grid=build_param_grid(name) if tune else None,
                     )
+                    id_results[group_key][name] = result
                     summaries = summarise_run(result)
                     row = {
                         "regime": regime.value,
@@ -194,6 +267,7 @@ def _identification_and_verification(
                         "n_template_dims": result.n_features,
                         "classifier": name,
                         "n_folds": result.n_folds,
+                        "tuned": tune,
                     }
                     for m in METRIC_NAMES:
                         row[f"{m}_mean"] = summaries[m].mean
@@ -210,6 +284,12 @@ def _identification_and_verification(
                     ver = run_verification_cv(bundle, mode=mode, n_folds=n_folds)
                     eer = ver.eer_values()
                     deci = ver.decidability_values()
+                    finite_eer = eer[np.isfinite(eer)]
+                    # Verification EER gets the same Nadeau-Bengio corrected CI as
+                    # identification, so the two protocols are reported at equal rigour.
+                    eer_ci_lo, eer_ci_hi = nadeau_bengio_ci_mean(
+                        finite_eer, n_folds=n_folds,
+                    ) if finite_eer.size > 1 else (float("nan"), float("nan"))
                     ver_rows.append({
                         "regime": regime.value,
                         "feature_level": level,
@@ -218,9 +298,14 @@ def _identification_and_verification(
                         "n_folds": ver.n_folds,
                         "eer_mean": float(np.nanmean(eer)),
                         "eer_std": float(np.nanstd(eer, ddof=1)) if eer.size > 1 else 0.0,
+                        "eer_ci_lo": eer_ci_lo,
+                        "eer_ci_hi": eer_ci_hi,
                         "decidability_mean": float(np.nanmean(deci)),
+                        "decidability_std": (
+                            float(np.nanstd(deci, ddof=1)) if deci.size > 1 else 0.0
+                        ),
                     })
-    return pd.DataFrame(id_rows), pd.DataFrame(ver_rows)
+    return pd.DataFrame(id_rows), pd.DataFrame(ver_rows), id_results
 
 
 def _cancelability_df(
@@ -444,6 +529,8 @@ def _stolen_token_df(
                 "n_genuine": r.n_genuine,
                 "n_impostor": r.n_impostor,
                 "eer": r.eer,
+                "eer_ci_lo": r.eer_ci_low,
+                "eer_ci_hi": r.eer_ci_high,
                 "decidability": r.decidability,
                 "genuine_mean": r.genuine_mean,
                 "impostor_mean": r.impostor_mean,
@@ -499,7 +586,14 @@ def _holdout_df(
     binarise: bool,
     test_fraction: float,
 ) -> pd.DataFrame:
-    """Sealed temporal-holdout evaluation: fit on train, score the held-out tail."""
+    """Temporal-holdout evaluation: fit on train, score the held-out tail.
+
+    Every subject appears in both halves (this is a within-subject temporal
+    split, not an unseen-subject test — for that see :func:`_subject_holdout_df`).
+    The pre-projection standardiser is fitted on the **train** split only and
+    reused on the test split, so the held-out templates never see their own
+    statistics (leakage-free).
+    """
     split = temporal_holdout_per_subject(segments, test_fraction=test_fraction)
     rows = []
     for regime in regimes:
@@ -510,7 +604,7 @@ def _holdout_df(
             )
             test_b = build_templates(
                 split.test, feature_level=level, projection_ratio=projection_ratio,
-                binarise=binarise, key_mode=regime,
+                binarise=binarise, key_mode=regime, scaler=train_b.scaler,
             )
             for name in CLASSIFIER_NAMES:
                 pipe = make_pipeline(clone(build_classifier(name)))
@@ -530,6 +624,87 @@ def _holdout_df(
                     **ranks,
                 })
     return pd.DataFrame(rows)
+
+
+def _subject_holdout_df(
+    segments: BiometricSegments,
+    *,
+    regimes: tuple[KeyMode, ...],
+    feature_levels: tuple[int, ...],
+    projection_ratio: float,
+    binarise: bool,
+    test_fraction: float,
+    n_folds: int,
+    seed: int,
+) -> pd.DataFrame:
+    """Quasi-external (subject-disjoint) verification on unseen subjects.
+
+    The test cohort shares **no subject** with the train cohort, so this is the
+    non-random, unseen-subject generalisation evidence a Q1 reviewer expects on
+    top of internal CV. Only the 1:1 verification protocol is reported: closed-set
+    identification on unseen subjects is undefined (their classes never appear in
+    any training set), so reporting it would be meaningless.
+    """
+    split = subject_holdout(segments, test_fraction=test_fraction, seed=seed)
+    n_test_subjects = int(np.unique(split.test.labels).size)
+    # Verification CV partitions by group, so it needs at least as many test
+    # subjects as folds. Shrink the fold count to fit a small held-out cohort and
+    # skip entirely if even two subjects are unavailable (no impostor pairs).
+    eff_folds = min(n_folds, n_test_subjects)
+    if n_test_subjects < 2 or eff_folds < 2:
+        logger.warning(
+            "Subject-holdout skipped: only %d held-out subject(s) — need ≥ 2 for "
+            "verification (raise --holdout-fraction or use more subjects).",
+            n_test_subjects,
+        )
+        return pd.DataFrame()
+    rows = []
+    for regime in regimes:
+        for level in feature_levels:
+            test_b = build_templates(
+                split.test, feature_level=level, projection_ratio=projection_ratio,
+                binarise=binarise, key_mode=regime,
+            )
+            for mode in ("closed_set", "open_set"):
+                try:
+                    ver = run_verification_cv(test_b, mode=mode, n_folds=eff_folds)
+                except ValueError as exc:  # degenerate split (too few groups/blocks)
+                    logger.warning(
+                        "Subject-holdout %s verification skipped (%s).", mode, exc,
+                    )
+                    continue
+                eer = ver.eer_values()
+                deci = ver.decidability_values()
+                finite_eer = eer[np.isfinite(eer)]
+                eer_ci_lo, eer_ci_hi = nadeau_bengio_ci_mean(
+                    finite_eer, n_folds=eff_folds,
+                ) if finite_eer.size > 1 else (float("nan"), float("nan"))
+                rows.append({
+                    "regime": regime.value,
+                    "feature_level": level,
+                    "verification_mode": mode,
+                    "n_test_subjects": n_test_subjects,
+                    "n_folds": ver.n_folds,
+                    "eer_mean": float(np.nanmean(eer)),
+                    "eer_std": float(np.nanstd(eer, ddof=1)) if eer.size > 1 else 0.0,
+                    "eer_ci_lo": eer_ci_lo,
+                    "eer_ci_hi": eer_ci_hi,
+                    "decidability_mean": float(np.nanmean(deci)),
+                })
+    return pd.DataFrame(rows)
+
+
+def _significance_df(
+    id_results: dict[str, dict[str, object]], *, n_folds: int,
+) -> pd.DataFrame:
+    """Pairwise classifier significance with Benjamini-Hochberg FDR correction.
+
+    Compares classifiers on identical folds with the Nadeau-Bengio corrected
+    paired t-test, then controls the false-discovery rate over the whole
+    (regime × level × metric × pair) family.
+    """
+    comparisons = compare_classifiers(id_results, METRIC_NAMES, n_folds=n_folds)
+    return pd.DataFrame([asdict(c) for c in comparisons])
 
 
 def _plot_figures(
@@ -661,6 +836,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--cv-folds", type=int, default=5)
     parser.add_argument("--split-seeds", type=int, nargs="+", default=list(DEFAULT_SPLIT_SEEDS))
     parser.add_argument(
+        "--tune", action="store_true",
+        help="Tune classifier hyperparameters with a group-aware inner CV on each "
+             "outer fold (nested CV). Without it the fixed reference configs are used.",
+    )
+    parser.add_argument(
         "--regimes", type=str, nargs="+",
         default=[r.value for r in DEFAULT_REGIMES], choices=[r.value for r in KeyMode],
     )
@@ -691,7 +871,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--timing", action="store_true",
                         help="Per-stage computational-cost benchmark with bootstrap CI.")
     parser.add_argument("--holdout", action="store_true",
-                        help="Sealed temporal-holdout evaluation (fit on train, score the tail).")
+                        help="Within-subject temporal-holdout (fit on train, score the tail; "
+                             "scaler fitted on train only).")
+    parser.add_argument("--subject-holdout", action="store_true",
+                        help="Subject-disjoint (unseen-subject) verification holdout — the "
+                             "non-random external-generalisation evidence.")
+    parser.add_argument("--significance", action="store_true",
+                        help="Pairwise classifier significance tests (Nadeau-Bengio paired t "
+                             "+ Benjamini-Hochberg FDR correction) over the identification grid.")
     parser.add_argument("--holdout-fraction", type=float, default=0.20)
     parser.add_argument("--det-plots", action="store_true",
                         help="Render the figure suite: DET/ROC/PR curves, per-regime "
@@ -710,6 +897,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         args.stolen_token = True
         args.timing = True
         args.holdout = True
+        args.subject_holdout = True
+        args.significance = True
         args.det_plots = True
         if args.cancelability_keys < 2:
             args.cancelability_keys = 16
@@ -740,8 +929,13 @@ def main(argv: list[str] | None = None) -> None:
         feature_levels, representative_level,
     )
     out = args.output_dir
+    _write_manifest(
+        out, args,
+        n_segments=segments.num_segments,
+        n_subjects=segments.num_subjects,
+    )
 
-    id_df, ver_df = _identification_and_verification(
+    id_df, ver_df, id_results = _identification_and_verification(
         segments,
         regimes=regimes,
         feature_levels=feature_levels,
@@ -751,9 +945,16 @@ def main(argv: list[str] | None = None) -> None:
         split_seeds=tuple(args.split_seeds),
         run_identification=args.protocol in ("identification", "both"),
         run_verification=args.protocol in ("verification", "both"),
+        tune=args.tune,
     )
     _save_csv(id_df, out / "metrics.csv")
     _save_csv(ver_df, out / "verification.csv")
+
+    if args.significance and id_results:
+        _save_csv(
+            _significance_df(id_results, n_folds=args.cv_folds),
+            out / "significance.csv",
+        )
 
     if args.cancelability_keys >= 2:
         _save_csv(
@@ -839,6 +1040,16 @@ def main(argv: list[str] | None = None) -> None:
                 test_fraction=args.holdout_fraction,
             ),
             out / "holdout.csv",
+        )
+    if args.subject_holdout:
+        _save_csv(
+            _subject_holdout_df(
+                segments, regimes=regimes, feature_levels=(representative_level,),
+                projection_ratio=args.projection_ratio, binarise=args.binarise,
+                test_fraction=args.holdout_fraction, n_folds=args.cv_folds,
+                seed=args.seed,
+            ),
+            out / "subject_holdout.csv",
         )
     if args.det_plots:
         _plot_figures(

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache
@@ -22,7 +23,8 @@ from typing import Final
 import numpy as np
 from joblib import Parallel, delayed, parallel_config
 from numpy.typing import NDArray
-from sklearn.base import ClassifierMixin, clone
+from sklearn.base import BaseEstimator, ClassifierMixin, clone
+from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -43,7 +45,7 @@ from .constants import (
 )
 from .cv_splits import stratified_group_splitter, temporal_block_groups
 from .dataset import BiometricSegments
-from .feature_transform import transform_multimodal_batch
+from .feature_transform import FeatureScaler, transform_multimodal_batch
 from .features import extract_features_batch, feature_dimension
 from .metrics import ClassificationMetrics, evaluate
 from .noise import add_awgn_batch
@@ -183,11 +185,17 @@ class TemplateBundle:
             the ``(B, m)`` BioHashing projection otherwise).
         labels: ``(B,)`` subject labels aligned with ``features``.
         key_mode: Regime under which the templates were built.
+        scaler: The :class:`FeatureScaler` fitted on this cohort's features
+            before the projection (``None`` for IDENTITY or when standardisation
+            is disabled). Pass it to a held-out cohort's :func:`build_templates`
+            to standardise the test set with *train* statistics — the
+            leakage-free path used by the sealed holdout.
     """
 
     features: NDArray[np.float64]
     labels: NDArray[np.int64]
     key_mode: KeyMode
+    scaler: FeatureScaler | None = None
 
 
 def build_templates(
@@ -203,6 +211,7 @@ def build_templates(
     ecg_method: str = DEFAULT_ECG_CLEAN,
     ppg_method: str = DEFAULT_PPG_CLEAN,
     key_mode: KeyMode = KeyMode.PER_SUBJECT,
+    scaler: FeatureScaler | None = None,
     config: PipelineConfig | None = None,
 ) -> TemplateBundle:
     """Run AWGN → clean → multimodal feature extraction → (BioHash | identity).
@@ -213,12 +222,15 @@ def build_templates(
         feature_wavelet: Wavelet family for feature extraction.
         projection_ratio: BioHashing template length as a fraction ``m/d``.
         binarise: Whether to sign-binarise the BioHashing projection.
-        standardize: Whether to per-feature z-score on the cohort before the
-            projection (see :data:`DEFAULT_STANDARDIZE`). Ignored for
-            :attr:`KeyMode.IDENTITY` (no projection). The scaler is fitted on
-            the whole cohort, which is the enrolment population; for a strictly
-            leakage-free per-fold estimate, fit a :class:`FeatureScaler` on the
-            train split and pass it to :func:`transform_multimodal_batch` directly.
+        standardize: Whether to per-feature z-score before the projection (see
+            :data:`DEFAULT_STANDARDIZE`). Ignored for :attr:`KeyMode.IDENTITY`
+            (no projection). When ``scaler`` is ``None`` the scaler is fitted on
+            *this* cohort; pass a train-fitted ``scaler`` to standardise a
+            held-out cohort with train statistics (the leakage-free holdout path).
+        scaler: Optional pre-fitted :class:`FeatureScaler`. When given it
+            overrides ``standardize`` and is applied verbatim, so test segments
+            never see their own statistics. The fitted (or supplied) scaler is
+            returned on :attr:`TemplateBundle.scaler`.
         snr_db: AWGN SNR injected pre-clean (``None`` to skip).
         noise_seed: Seed for AWGN injection.
         denoise: Whether to run NeuroKit physiological cleaning.
@@ -254,17 +266,25 @@ def build_templates(
         ecg, ppg, wavelet=feature_wavelet, level=feature_level,
     )
 
+    effective_scaler: FeatureScaler | None = None
     if key_mode == KeyMode.IDENTITY:
         templates = features
     else:
         tokens = _tokens_for(segments.labels, key_mode)
         assert tokens is not None
+        # Fit the standardiser on this cohort only when one is not supplied, so
+        # a held-out cohort can reuse the train-fitted scaler (leakage-free).
+        effective_scaler = (
+            scaler if scaler is not None
+            else (FeatureScaler.fit(features) if standardize else None)
+        )
         templates = transform_multimodal_batch(
             features,
             tokens,
             projection_ratio=projection_ratio,
             binarise=binarise,
-            standardize=standardize,
+            standardize=False,
+            scaler=effective_scaler,
         )
 
     logger.info(
@@ -278,7 +298,12 @@ def build_templates(
         standardize,
         templates.shape[1],
     )
-    return TemplateBundle(features=templates, labels=segments.labels.copy(), key_mode=key_mode)
+    return TemplateBundle(
+        features=templates,
+        labels=segments.labels.copy(),
+        key_mode=key_mode,
+        scaler=effective_scaler,
+    )
 
 
 def _score_matrix(estimator: ClassifierMixin, x: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -294,6 +319,10 @@ def _score_matrix(estimator: ClassifierMixin, x: NDArray[np.float64]) -> NDArray
     return np.asarray(estimator.predict_proba(x), dtype=np.float64)
 
 
+DEFAULT_INNER_FOLDS: Final[int] = 3
+DEFAULT_TUNE_SCORING: Final[str] = "f1_macro"
+
+
 def make_pipeline(classifier: ClassifierMixin) -> Pipeline:
     """Wrap ``classifier`` in a ``StandardScaler`` + classifier pipeline.
 
@@ -304,6 +333,49 @@ def make_pipeline(classifier: ClassifierMixin) -> Pipeline:
         A scikit-learn :class:`Pipeline`.
     """
     return Pipeline(steps=[("scaler", StandardScaler()), ("clf", classifier)])
+
+
+def _build_fold_estimator(
+    classifier: ClassifierMixin,
+    param_grid: Mapping[str, list] | None,
+    groups_train: NDArray[np.int64] | None,
+    labels_train: NDArray[np.int64],
+    inner_folds: int,
+    scoring: str,
+) -> tuple[BaseEstimator, bool]:
+    """Build the per-fold estimator, tuning hyperparameters when a grid is given.
+
+    Returns:
+        Tuple ``(estimator, needs_groups)``. When ``param_grid`` is non-empty and
+        the train slice has enough groups for a stratified group inner CV, the
+        estimator is a :class:`~sklearn.model_selection.GridSearchCV` over the
+        scaler+clf pipeline (``needs_groups`` is ``True``); otherwise it is the
+        plain pipeline with the fixed hyperparameters (``needs_groups`` ``False``).
+        Falling back keeps small/degenerate folds working instead of crashing the
+        inner split.
+    """
+    pipe = make_pipeline(clone(classifier))
+    if not param_grid or groups_train is None:
+        return pipe, False
+    # StratifiedGroupKFold needs every class present in at least ``inner_folds``
+    # distinct groups; bail to the fixed config when the train slice is too thin.
+    enough_groups_per_class = all(
+        np.unique(groups_train[labels_train == cls]).size >= inner_folds
+        for cls in np.unique(labels_train)
+    )
+    if not enough_groups_per_class or np.unique(groups_train).size < inner_folds:
+        return pipe, False
+    inner_cv = stratified_group_splitter(n_splits=inner_folds, random_state=DEFAULT_SEED)
+    search = GridSearchCV(
+        pipe,
+        param_grid=dict(param_grid),
+        cv=inner_cv,
+        scoring=scoring,
+        refit=True,
+        n_jobs=1,  # outer parallelism already saturates cores; avoid oversubscription
+        error_score="raise",
+    )
+    return search, True
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,10 +448,19 @@ def _fit_fold(
     train_idx: NDArray[np.int64],
     test_idx: NDArray[np.int64],
     classifier: ClassifierMixin,
+    param_grid: Mapping[str, list] | None = None,
+    groups: NDArray[np.int64] | None = None,
+    inner_folds: int = DEFAULT_INNER_FOLDS,
+    tune_scoring: str = DEFAULT_TUNE_SCORING,
 ) -> tuple[
     NDArray[np.int64], NDArray[np.int64], NDArray[np.float64], NDArray[np.int64]
 ]:
-    """Fit a fresh pipeline on the train slice and predict on the test slice.
+    """Fit a fresh (optionally tuned) pipeline on the train slice and predict.
+
+    When ``param_grid`` is supplied, hyperparameters are selected by a group-aware
+    inner cross-validation on the *train slice only* — the outer fold's test slice
+    is never seen during selection, so the reported scores stay unbiased (nested
+    CV). Otherwise the fixed-hyperparameter pipeline is fitted directly.
 
     Args:
         features: ``(B, d)`` feature matrix.
@@ -387,17 +468,30 @@ def _fit_fold(
         train_idx: Integer indices selecting the train slice.
         test_idx: Integer indices selecting the test slice.
         classifier: Classifier prototype; cloned before fitting.
+        param_grid: Optional ``clf__``-prefixed grid enabling the inner tuning CV.
+        groups: ``(B,)`` group ids (temporal blocks) for the inner group split;
+            required for tuning.
+        inner_folds: Folds for the inner tuning CV.
+        tune_scoring: Scoring metric optimised by the inner CV.
 
     Returns:
         Tuple ``(y_test, y_pred, y_score, classes)`` ready for scoring.
     """
     x_train, x_test = features[train_idx], features[test_idx]
     y_train, y_test = labels[train_idx], labels[test_idx]
-    pipe = make_pipeline(clone(classifier))
-    pipe.fit(x_train, y_train)
-    y_pred = pipe.predict(x_test)
-    y_score = _score_matrix(pipe, x_test)
-    classes = np.asarray(pipe.named_steps["clf"].classes_, dtype=np.int64)
+    groups_train = None if groups is None else np.asarray(groups)[train_idx]
+    estimator, needs_groups = _build_fold_estimator(
+        classifier, param_grid, groups_train, y_train, inner_folds, tune_scoring,
+    )
+    if needs_groups:
+        estimator.fit(x_train, y_train, groups=groups_train)
+    else:
+        estimator.fit(x_train, y_train)
+    y_pred = estimator.predict(x_test)
+    y_score = _score_matrix(estimator, x_test)
+    # ``.classes_`` is exposed by both Pipeline (via the final step) and
+    # GridSearchCV (via the refit best estimator), so it works for either path.
+    classes = np.asarray(estimator.classes_, dtype=np.int64)
     return y_test, y_pred, y_score, classes
 
 
@@ -408,6 +502,8 @@ def _fit_eval_fold_full(
     test_idx: NDArray[np.int64],
     classifier: ClassifierMixin,
     ranks: tuple[int, ...],
+    param_grid: Mapping[str, list] | None = None,
+    groups: NDArray[np.int64] | None = None,
 ) -> FoldEvaluation:
     """Fit once and derive classification metrics and rank-``k`` accuracies.
 
@@ -418,12 +514,15 @@ def _fit_eval_fold_full(
         test_idx: Integer indices selecting the test slice.
         classifier: Classifier prototype; cloned before fitting.
         ranks: Ranks for the CMC accuracies.
+        param_grid: Optional inner-CV tuning grid (see :func:`_fit_fold`).
+        groups: Group ids for the inner group split when tuning.
 
     Returns:
         A :class:`FoldEvaluation` bundling the two per-fold outputs.
     """
     y_test, y_pred, y_score, classes = _fit_fold(
-        features, labels, train_idx, test_idx, classifier
+        features, labels, train_idx, test_idx, classifier,
+        param_grid=param_grid, groups=groups,
     )
     metrics = evaluate(y_test, y_pred, y_score, classes=classes)
     rank_acc = rank_k_accuracies(y_test, y_score, classes, ranks=ranks)
@@ -439,6 +538,7 @@ def cross_validate_classifier_multiseed(
     segments_per_block: int = DEFAULT_SEGMENTS_PER_BLOCK,
     ranks: tuple[int, ...] = DEFAULT_RANKS,
     n_jobs: int | None = None,
+    param_grid: Mapping[str, list] | None = None,
 ) -> CrossValidationResult:
     """Aggregate fold metrics across multiple split seeds.
 
@@ -454,6 +554,10 @@ def cross_validate_classifier_multiseed(
         segments_per_block: Block size for temporal grouping.
         ranks: Ranks for the per-fold CMC accuracies stored in ``fold_extras``.
         n_jobs: Parallel workers; ``None`` reads :data:`CV_N_JOBS`.
+        param_grid: Optional ``clf__``-prefixed hyperparameter grid. When given,
+            each outer fold tunes the classifier with a group-aware inner CV on
+            its train slice only (nested CV) — the unbiased way to report a tuned
+            model. When ``None`` the fixed reference configuration is used.
 
     Returns:
         A :class:`CrossValidationResult` whose ``fold_metrics`` /
@@ -474,7 +578,10 @@ def cross_validate_classifier_multiseed(
 
     if effective_n_jobs == 1 or len(fold_specs) <= 1:
         fold_evals = [
-            _fit_eval_fold_full(bundle.features, bundle.labels, tr, te, classifier, ranks)
+            _fit_eval_fold_full(
+                bundle.features, bundle.labels, tr, te, classifier, ranks,
+                param_grid=param_grid, groups=groups,
+            )
             for _, _, tr, te in fold_specs
         ]
     else:
@@ -490,6 +597,8 @@ def cross_validate_classifier_multiseed(
                     te,
                     classifier,
                     ranks,
+                    param_grid,
+                    groups,
                 )
                 for _, _, tr, te in fold_specs
             )

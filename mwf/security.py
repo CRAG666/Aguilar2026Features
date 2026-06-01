@@ -152,31 +152,43 @@ def key_sensitivity(
     base_password: str,
     n_trials: int = 32,
     bits: int = DEFAULT_QUANTISATION_BITS,
+    seed: int = 0,
 ) -> KeySensitivityReport:
-    """Estimate key-sensitivity statistics under up to ``n_trials`` bit edits.
+    """Estimate key-sensitivity statistics over ``n_trials`` independent edits.
+
+    Each trial draws an **independent** base token (``f"{base_password}#{i}"``)
+    and flips one **random** bit of it, so the trials are i.i.d. draws over the
+    token space rather than a deterministic bit-walk of a single password. The
+    old sequential-bit-flip design exhausted the short token's bits and produced
+    correlated samples whose std understated the true variance; independent draws
+    give an honest mean ± std for the renewability/diversity claim.
 
     Args:
         transform_fn: Token→template callable.
-        base_password: Reference token whose bits are flipped.
-        n_trials: Maximum bit-flip attempts.
+        base_password: Prefix anchoring the per-trial independent base tokens.
+        n_trials: Number of independent 1-bit-edit trials.
         bits: Quantisation depth.
+        seed: RNG seed for the per-trial random bit selection.
 
     Returns:
         A :class:`KeySensitivityReport` summarising the trials.
 
     Raises:
-        ValueError: If every edit collapsed back to the base token.
+        ValueError: If every edit collapsed back to its base token.
     """
-    base = transform_fn(base_password)
-    base_q = _quantise(base, bits=bits)
-
-    trials = [
-        _single_trial(base, base_q, transform_fn(edited), bits)
-        for edited in (_flip_one_bit(base_password, k) for k in range(n_trials))
-        if edited != base_password
-    ]
+    rng = np.random.default_rng(seed)
+    trials: list[tuple[float, float]] = []
+    for i in range(n_trials):
+        base_token = f"{base_password}#{i}"
+        base = transform_fn(base_token)
+        base_q = _quantise(base, bits=bits)
+        n_bits = len(base_token.encode("utf-8")) * 8
+        edited = _flip_one_bit(base_token, int(rng.integers(0, n_bits)))
+        if edited == base_token:
+            continue
+        trials.append(_single_trial(base, base_q, transform_fn(edited), bits))
     if not trials:
-        raise ValueError("Every 1-bit edit collapsed back to the base token.")
+        raise ValueError("Every 1-bit edit collapsed back to its base token.")
     bers, corrs = (np.asarray(col, dtype=np.float64) for col in zip(*trials))
     return KeySensitivityReport(
         n_trials=int(bers.size),

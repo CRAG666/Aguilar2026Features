@@ -68,6 +68,30 @@ from .scoring import cosine_score_matrix, l2_normalise
 logger = logging.getLogger(__name__)
 
 DEFAULT_NON_MATED_PAIRS_PER_VICTIM: Final[int] = 8
+_GAP_BOOTSTRAP_RESAMPLES: Final[int] = 1000
+_GAP_BOOTSTRAP_LEVEL: Final[float] = 0.95
+
+
+def _bootstrap_gap_ci(
+    mated_abs: NDArray[np.float64],
+    non_mated_abs: NDArray[np.float64],
+    rng: np.random.Generator,
+) -> tuple[float, float]:
+    """Percentile CI for the leakage gap ``mean|mated| − mean|non_mated|``.
+
+    Resamples the two correlation pools independently with replacement and
+    recomputes the gap, so the reported figure of merit carries a distribution-
+    free interval instead of a single point estimate.
+    """
+    if mated_abs.size < 2 or non_mated_abs.size < 2:
+        return float("nan"), float("nan")
+    gaps = np.empty(_GAP_BOOTSTRAP_RESAMPLES, dtype=np.float64)
+    for b in range(_GAP_BOOTSTRAP_RESAMPLES):
+        m = rng.choice(mated_abs, size=mated_abs.size, replace=True)
+        n = rng.choice(non_mated_abs, size=non_mated_abs.size, replace=True)
+        gaps[b] = float(m.mean() - n.mean())
+    tail = (1.0 - _GAP_BOOTSTRAP_LEVEL) / 2.0
+    return float(np.quantile(gaps, tail)), float(np.quantile(gaps, 1.0 - tail))
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +111,8 @@ class NonInvertibilityReport:
         genuine_ref_std: Std of the genuine-reference pool.
         leakage_gap: ``mated_mean − non_mated_mean``. Wu's gold standard is
             ``≈ 0`` (no target-specific leakage).
+        leakage_gap_ci_low: Lower 95 % bootstrap bound on ``leakage_gap``.
+        leakage_gap_ci_high: Upper 95 % bootstrap bound on ``leakage_gap``.
         sar_type1: Protected-system SAR — fraction of re-protected
             reconstructions that pass the verifier at its EER threshold.
         sar_type2: Raw-feature SAR — fraction of reconstructions that pass an
@@ -110,6 +136,8 @@ class NonInvertibilityReport:
     genuine_ref_mean: float
     genuine_ref_std: float
     leakage_gap: float
+    leakage_gap_ci_low: float
+    leakage_gap_ci_high: float
     sar_type1: float
     sar_type2: float
     sar_threshold_type1: float
@@ -129,8 +157,14 @@ def _reconstruct_features(
 
     Mirrors :func:`mwf.inversion.multimodal_leakage_metrics`: the ECG half is
     recovered with ``Rᵀ y``; the PPG half with the IoM winner-direction sum.
-    Real-valued (non-binarised) projection is used as the conservative,
-    adversary-favouring upper bound on what is recoverable.
+
+    Scope of the claim: this is the *linear / min-norm* inversion, which is a
+    **lower bound on attacker capability** — a stronger adversary running a
+    learning- or optimisation-based inversion (e.g. Mai et al. 2019 genetic
+    attack, gradient inversion) can recover more. The reported leakage is
+    therefore "what the closed-form linear pre-image leaks", not a worst-case
+    over all attacks; the real-valued (non-binarised) projection is used as the
+    most favourable case *within that linear family*.
 
     Args:
         features: ``(n, d)`` extracted feature matrix (even ``d``; ECG‖PPG).
@@ -330,10 +364,13 @@ def non_invertibility_analysis(
     eer_raw, thr_raw = _eer_threshold(gen_raw, imp_raw)
     sar2 = _sar(features, recovered, labels, uniq, thr_raw)
 
-    abs_or = lambda a: np.abs(a) if a.size else a
+    def abs_or(a: NDArray[np.float64]) -> NDArray[np.float64]:
+        return np.abs(a) if a.size else a
+
     mated_abs = abs_or(mated)
     non_mated_abs = abs_or(non_mated)
     genuine_ref_abs = abs_or(genuine_ref)
+    gap_ci_low, gap_ci_high = _bootstrap_gap_ci(mated_abs, non_mated_abs, make_rng(seed + 211))
 
     report = NonInvertibilityReport(
         n_victims=int(uniq.size),
@@ -350,6 +387,8 @@ def non_invertibility_analysis(
             float(mated_abs.mean() - non_mated_abs.mean())
             if mated.size and non_mated.size else float("nan")
         ),
+        leakage_gap_ci_low=gap_ci_low,
+        leakage_gap_ci_high=gap_ci_high,
         sar_type1=sar1,
         sar_type2=sar2,
         sar_threshold_type1=thr_p,

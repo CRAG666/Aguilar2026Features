@@ -32,7 +32,7 @@ DEFAULT_CI_LEVEL: Final[float] = BOOTSTRAP_CI_LEVEL
 DEFAULT_GLOBAL_SEED: Final[int] = DEFAULT_SEED
 
 METRIC_NAMES: Final[tuple[str, ...]] = (
-    "accuracy", "auc", "eer", "precision", "recall", "f1", "ap",
+    "accuracy", "balanced_accuracy", "auc", "eer", "precision", "recall", "f1", "ap",
 )
 
 # Only group-aware splitters are offered. The biometric cohort has several

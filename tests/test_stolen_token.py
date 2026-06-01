@@ -68,6 +68,28 @@ def test_genuine_separates_from_impostor_under_shared_token():
     assert result.eer < 0.45  # clearly better than chance
 
 
+def test_eer_bootstrap_ci_brackets_point_estimate():
+    """The reported EER must sit inside its bootstrap CI, and the CI be ordered."""
+    cohort = _synthetic_cohort(jitter=0.05)
+    result = stolen_token_verification(cohort, denoise=False, feature_level=3)
+    assert result.eer_ci_low <= result.eer + 1e-9
+    assert result.eer <= result.eer_ci_high + 1e-9
+
+
+def test_znorm_uses_disjoint_cohort_not_self_normalisation():
+    """The z-norm impostor pool is a disjoint subject subset, so it is smaller
+    than the raw impostor pool (which scores every impostor) — evidence the
+    normalisation statistics are not estimated from the scored impostors."""
+    cohort = _synthetic_cohort(n_subjects=8)
+    _, raw_imp = stolen_token_score_pools(
+        cohort, denoise=False, feature_level=3, score_norm=None
+    )
+    _, zn_imp = stolen_token_score_pools(
+        cohort, denoise=False, feature_level=3, score_norm="znorm"
+    )
+    assert zn_imp.size < raw_imp.size
+
+
 def test_znorm_option_runs_and_changes_scores():
     cohort = _synthetic_cohort()
     raw_g, _ = stolen_token_score_pools(

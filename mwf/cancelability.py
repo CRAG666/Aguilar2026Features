@@ -36,6 +36,16 @@ DEFAULT_N_KEYS: Final[int] = 32  # wide enough for a tight D_↔^sys CI
 DEFAULT_RANDOM_STATE: Final[int] = DEFAULT_SEED
 _RANDOM_TOKEN_PREFIX: Final[str] = "RAND_TOK_"
 _SCORE_BINS: Final[int] = 200
+_BOOTSTRAP_RESAMPLES: Final[int] = 500  # key-level resamples for the CIs
+_BOOTSTRAP_LEVEL: Final[float] = 0.95
+# A renewable transform should decorrelate templates down to the chance level of
+# two independent vectors, not to an arbitrary absolute constant. The pass/fail
+# margin below is a multiple of that analytical chance |r| (≈ √(2/(π(L−1))) for
+# length-L i.i.d. vectors), so the thresholds are referenced to a null baseline
+# rather than to magic numbers.
+_DIVERSITY_CHANCE_MARGIN: Final[float] = 1.5
+_RENEWABILITY_MAX_RATIO: Final[float] = 0.05
+_UNLINKABILITY_MAX_DSYS: Final[float] = 0.05
 
 
 def _random_tokens(n_keys: int, seed: int) -> list[str]:
@@ -150,40 +160,66 @@ def _d_sys_curve(mated: NDArray[np.float64], non_mated: NDArray[np.float64]) -> 
 
 @dataclass(frozen=True, slots=True)
 class CancelabilityReport:
-    """ISO/IEC 30136 cancelability summary.
+    """ISO/IEC 30136 cancelability summary with key-level bootstrap CIs.
+
+    Every figure of merit carries a 95 % percentile-bootstrap CI resampled over
+    the random keys, so the report states uncertainty rather than a single point
+    estimate. The pass/fail flags are referenced to statistical baselines (a
+    chance |r| for diversity) instead of bare constants.
 
     Attributes:
         n_keys: Number of random keys exercised.
         renewability_genuine_mean: Mean cross-key genuine-pair score.
         renewability_baseline_mean: Mean same-key genuine-pair score.
         renewability_ratio: ``genuine_mean / baseline_mean``.
+        renewability_ratio_ci_low: Lower CI bound on the ratio.
+        renewability_ratio_ci_high: Upper CI bound on the ratio.
         diversity_mean_abs_corr: Mean cross-key per-subject correlation.
         diversity_std_abs_corr: Std of the same.
+        diversity_ci_low: Lower CI bound on the mean ``|corr|``.
+        diversity_ci_high: Upper CI bound on the mean ``|corr|``.
+        diversity_chance_abs_corr: Analytical chance-level ``|corr|`` of two
+            independent vectors of the template's length — the null baseline the
+            measured diversity is compared against.
         unlinkability_d_sys: Global Gomez-Barrero ``D_↔^sys``.
+        unlinkability_d_sys_ci_low: Lower CI bound on ``D_↔^sys``.
+        unlinkability_d_sys_ci_high: Upper CI bound on ``D_↔^sys``.
     """
 
     n_keys: int
     renewability_genuine_mean: float
     renewability_baseline_mean: float
     renewability_ratio: float
+    renewability_ratio_ci_low: float
+    renewability_ratio_ci_high: float
     diversity_mean_abs_corr: float
     diversity_std_abs_corr: float
+    diversity_ci_low: float
+    diversity_ci_high: float
+    diversity_chance_abs_corr: float
     unlinkability_d_sys: float
+    unlinkability_d_sys_ci_low: float
+    unlinkability_d_sys_ci_high: float
 
     @property
     def renewable(self) -> bool:
-        """``True`` when ``renewability_ratio < 0.05``."""
-        return self.renewability_ratio < 0.05
+        """``True`` when the cross-key genuine score is ≤ 5 % of the baseline."""
+        return self.renewability_ratio < _RENEWABILITY_MAX_RATIO
 
     @property
     def diverse(self) -> bool:
-        """``True`` when ``diversity_mean_abs_corr < 0.01``."""
-        return self.diversity_mean_abs_corr < 0.01
+        """``True`` when mean ``|corr|`` stays within the chance-level margin.
+
+        Compared to ``_DIVERSITY_CHANCE_MARGIN × diversity_chance_abs_corr`` — the
+        decorrelation a perfectly key-randomising transform can be expected to
+        reach — rather than to an absolute constant.
+        """
+        return self.diversity_mean_abs_corr < _DIVERSITY_CHANCE_MARGIN * self.diversity_chance_abs_corr
 
     @property
     def unlinkable(self) -> bool:
-        """``True`` when ``unlinkability_d_sys < 0.05``."""
-        return self.unlinkability_d_sys < 0.05
+        """``True`` when ``unlinkability_d_sys < 0.05`` (Gomez-Barrero)."""
+        return self.unlinkability_d_sys < _UNLINKABILITY_MAX_DSYS
 
 
 def _same_key_genuine_mean(
@@ -257,6 +293,69 @@ def _standardize_columns(features: NDArray[np.float64]) -> NDArray[np.float64]:
     return np.nan_to_num(standardized, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def _diversity_chance_abs_corr(template_dim: int, segs_per_subject: float) -> float:
+    """Analytical chance-level ``|corr|`` for the diversity null baseline.
+
+    The diversity correlation is taken over a flattened ``(segs × template_dim)``
+    block. Under independence the sample Pearson ``r`` has std ``1/√(L−1)`` and a
+    folded-normal mean ``√(2/π)·std``, so the chance ``|r| ≈ √(2/(π(L−1)))`` for
+    block length ``L``. This is the level a perfectly key-randomising transform
+    would reach; the measured diversity is judged against it.
+    """
+    length = max(2.0, float(segs_per_subject) * float(template_dim))
+    return float(np.sqrt(2.0 / (np.pi * (length - 1.0))))
+
+
+def _percentile_ci(samples: NDArray[np.float64], level: float) -> tuple[float, float]:
+    """Central ``level`` percentile band of ``samples`` (NaNs dropped)."""
+    finite = samples[np.isfinite(samples)]
+    if finite.size < 2:
+        return float("nan"), float("nan")
+    tail = (1.0 - level) / 2.0
+    return float(np.quantile(finite, tail)), float(np.quantile(finite, 1.0 - tail))
+
+
+def _bootstrap_d_sys_ci(
+    mated_per_key: list[NDArray[np.float64]],
+    non_mated_per_key: list[NDArray[np.float64]],
+    rng: np.random.Generator,
+) -> tuple[float, float]:
+    """Percentile CI for ``D_↔^sys`` resampling the keys with replacement."""
+    n = len(mated_per_key)
+    if n < 2:
+        return float("nan"), float("nan")
+    vals = np.empty(_BOOTSTRAP_RESAMPLES, dtype=np.float64)
+    for b in range(_BOOTSTRAP_RESAMPLES):
+        pick = rng.integers(0, n, size=n)
+        mated = np.concatenate([mated_per_key[k] for k in pick])
+        non_mated = np.concatenate([non_mated_per_key[k] for k in pick])
+        vals[b] = _d_sys_curve(mated, non_mated).d_sys
+    return _percentile_ci(vals, _BOOTSTRAP_LEVEL)
+
+
+def _bootstrap_key_mean_ci(
+    per_key_values: list[NDArray[np.float64]],
+    rng: np.random.Generator,
+    scale: float = 1.0,
+) -> tuple[float, float]:
+    """Percentile CI for the pooled mean of per-key value arrays.
+
+    Resamples keys with replacement (the unit of independence), pools the chosen
+    keys' values and takes their mean, optionally divided by ``scale`` (used for
+    the renewability *ratio*, whose denominator is the fixed same-key baseline).
+    """
+    n = len(per_key_values)
+    if n < 2 or scale == 0.0:
+        return float("nan"), float("nan")
+    vals = np.empty(_BOOTSTRAP_RESAMPLES, dtype=np.float64)
+    for b in range(_BOOTSTRAP_RESAMPLES):
+        pick = rng.integers(0, n, size=n)
+        pooled = np.concatenate([per_key_values[k] for k in pick])
+        pooled = pooled[np.isfinite(pooled)]
+        vals[b] = float(pooled.mean()) / scale if pooled.size else np.nan
+    return _percentile_ci(vals, _BOOTSTRAP_LEVEL)
+
+
 def evaluate_cancelability(
     segments: BiometricSegments,
     feature_level: int = DEFAULT_FEATURE_LEVEL,
@@ -304,42 +403,64 @@ def evaluate_cancelability(
     tokens = _random_tokens(n_keys, seed=seed)
     base = _templates_for_token(features, tokens[0], projection_ratio, binarise)
     baseline_mean = _same_key_genuine_mean(base, segments.labels)
+    base_z = _standardize_columns(base)
 
-    renew_means: list[float] = []
-    diversity_corrs: list[float] = []
+    renew_per_key: list[NDArray[np.float64]] = []
+    diversity_per_key: list[NDArray[np.float64]] = []
     mated_pool: list[NDArray[np.float64]] = []
     non_mated_pool: list[NDArray[np.float64]] = []
 
     for token in tokens[1:]:
         reissued = _templates_for_token(features, token, projection_ratio, binarise)
         mated, non_mated = genuine_impostor_scores(base, reissued, segments.labels)
-        renew_means.append(float(mated.mean()))
+        renew_per_key.append(mated)
         mated_pool.append(mated)
         non_mated_pool.append(non_mated)
-        base_z = _standardize_columns(base)
         reissued_z = _standardize_columns(reissued)
+        key_corrs: list[float] = []
         for cls in np.unique(segments.labels):
             mask = segments.labels == cls
             if mask.sum() == 0:
                 continue
             corr = _abs_pearson(base_z[mask].ravel(), reissued_z[mask].ravel())
             if not np.isnan(corr):
-                diversity_corrs.append(corr)
+                key_corrs.append(corr)
+        diversity_per_key.append(np.asarray(key_corrs, dtype=np.float64))
 
-    if not renew_means:
+    if not renew_per_key:
         raise ValueError("n_keys must be ≥ 2 to evaluate cancelability.")
 
-    diversity_arr = np.asarray(diversity_corrs, dtype=np.float64)
+    boot_rng = make_rng(seed + 101)
+    diversity_arr = np.concatenate(diversity_per_key) if diversity_per_key else np.empty(0)
     curve = _d_sys_curve(np.concatenate(mated_pool), np.concatenate(non_mated_pool))
-    renew_mean = float(np.mean(renew_means))
+    renew_mean = float(np.concatenate(renew_per_key).mean())
+    renew_ratio = renew_mean / baseline_mean if baseline_mean else float("nan")
+
+    renew_ci_lo, renew_ci_hi = _bootstrap_key_mean_ci(
+        renew_per_key, boot_rng, scale=baseline_mean if baseline_mean else 1.0,
+    )
+    div_ci_lo, div_ci_hi = _bootstrap_key_mean_ci(diversity_per_key, boot_rng)
+    dsys_ci_lo, dsys_ci_hi = _bootstrap_d_sys_ci(mated_pool, non_mated_pool, boot_rng)
+    chance = _diversity_chance_abs_corr(
+        template_dim=int(base.shape[1]),
+        segs_per_subject=base.shape[0] / max(1, np.unique(segments.labels).size),
+    )
+
     report = CancelabilityReport(
         n_keys=n_keys,
         renewability_genuine_mean=renew_mean,
         renewability_baseline_mean=baseline_mean,
-        renewability_ratio=(renew_mean / baseline_mean if baseline_mean else float("nan")),
-        diversity_mean_abs_corr=float(diversity_arr.mean()),
+        renewability_ratio=renew_ratio,
+        renewability_ratio_ci_low=renew_ci_lo,
+        renewability_ratio_ci_high=renew_ci_hi,
+        diversity_mean_abs_corr=float(diversity_arr.mean()) if diversity_arr.size else float("nan"),
         diversity_std_abs_corr=std_or_zero(diversity_arr),
+        diversity_ci_low=div_ci_lo,
+        diversity_ci_high=div_ci_hi,
+        diversity_chance_abs_corr=chance,
         unlinkability_d_sys=curve.d_sys,
+        unlinkability_d_sys_ci_low=dsys_ci_lo,
+        unlinkability_d_sys_ci_high=dsys_ci_hi,
     )
     return (report, curve) if return_curve else report
 

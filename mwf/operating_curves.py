@@ -61,6 +61,68 @@ def det_curve_from_scores(
     return DetCurve(fmr=fmr, fnmr=fnmr, thresholds=thr)
 
 
+def eer_from_scores(
+    genuine: NDArray[np.float64], impostor: NDArray[np.float64]
+) -> float:
+    """Equal-error rate at the DET operating point where FMR ≈ FNMR.
+
+    Args:
+        genuine: 1-D array of genuine scores.
+        impostor: 1-D array of impostor scores.
+
+    Returns:
+        ``0.5·(FMR + FNMR)`` at the crossover, or NaN if either pool has < 2.
+    """
+    if genuine.size < 2 or impostor.size < 2:
+        return float("nan")
+    det = det_curve_from_scores(genuine, impostor)
+    idx = int(np.argmin(np.abs(det.fmr - det.fnmr)))
+    return float(0.5 * (det.fmr[idx] + det.fnmr[idx]))
+
+
+def bootstrap_eer_ci(
+    genuine: NDArray[np.float64],
+    impostor: NDArray[np.float64],
+    *,
+    n_resamples: int = 1000,
+    level: float = 0.95,
+    seed: int = 0,
+) -> tuple[float, float]:
+    """Percentile bootstrap CI for the EER of pooled genuine/impostor scores.
+
+    Genuine and impostor pools are resampled with replacement independently, the
+    EER is recomputed on each resample, and the central ``level`` percentile band
+    is returned — a distribution-free interval for the pooled-score EER that the
+    single point estimate lacks.
+
+    Args:
+        genuine: 1-D genuine score pool.
+        impostor: 1-D impostor score pool.
+        n_resamples: Bootstrap resamples.
+        level: Confidence level in ``(0, 1)``.
+        seed: RNG seed for the resampling.
+
+    Returns:
+        ``(low, high)`` EER bounds; ``(NaN, NaN)`` when either pool has < 2.
+    """
+    if genuine.size < 2 or impostor.size < 2:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    eers = np.empty(n_resamples, dtype=np.float64)
+    for b in range(n_resamples):
+        g = rng.choice(genuine, size=genuine.size, replace=True)
+        i = rng.choice(impostor, size=impostor.size, replace=True)
+        eers[b] = eer_from_scores(g, i)
+    eers = eers[np.isfinite(eers)]
+    if eers.size == 0:
+        return float("nan"), float("nan")
+    tail = (1.0 - level) / 2.0
+    return (
+        float(np.quantile(eers, tail)),
+        float(np.quantile(eers, 1.0 - tail)),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RocCurve:
     """ROC curve in (FPR, TPR) coordinates with its summary AUC.
@@ -323,8 +385,10 @@ __all__ = [
     "DetCurve",
     "PrCurve",
     "RocCurve",
+    "bootstrap_eer_ci",
     "cmc_curve",
     "det_curve_from_scores",
+    "eer_from_scores",
     "operating_points",
     "pr_curve_from_scores",
     "rank_k_accuracies",

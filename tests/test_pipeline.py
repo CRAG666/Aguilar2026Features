@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from mwf.classifiers import build_classifier
+from mwf.classifiers import build_classifier, build_param_grid
 from mwf.dataset import BiometricSegments
-from mwf.feature_transform import multimodal_dims
+from mwf.feature_transform import FeatureScaler, multimodal_dims
 from mwf.features import feature_dimension
 from mwf.pipeline import (
     KeyMode,
@@ -75,4 +75,43 @@ def test_cross_validate_classifier_multiseed_runs():
         n_folds=3, split_seeds=(42, 43), n_jobs=1,
     )
     assert result.n_folds == 6  # 2 seeds × 3 folds
+    assert np.all(np.isfinite(result.per_metric_values("accuracy")))
+    # balanced_accuracy is now a reported metric and must be populated.
+    assert np.all(np.isfinite(result.per_metric_values("balanced_accuracy")))
+
+
+def test_build_templates_returns_scaler_and_reuses_it_leakage_free():
+    """The pre-projection scaler is fitted on the cohort and can be reused on a
+    held-out cohort so the test set never sees its own statistics."""
+    seg = _toy_segments(n_subjects=4, per_subject=8)
+    bundle = build_templates(
+        seg, feature_level=3, key_mode=KeyMode.PER_SUBJECT, denoise=False,
+    )
+    assert isinstance(bundle.scaler, FeatureScaler)
+    # Reusing the fitted scaler on another cohort keeps the same object (no refit).
+    reused = build_templates(
+        seg, feature_level=3, key_mode=KeyMode.PER_SUBJECT, denoise=False,
+        scaler=bundle.scaler,
+    )
+    assert reused.scaler is bundle.scaler
+    # IDENTITY has no projection, hence no scaler.
+    ident = build_templates(
+        seg, feature_level=3, key_mode=KeyMode.IDENTITY, denoise=False,
+    )
+    assert ident.scaler is None
+
+
+def test_nested_cv_tuning_runs_and_matches_fold_count():
+    """Passing a param grid enables the inner tuning CV without changing the
+    outer fold accounting."""
+    seg = _toy_segments(n_subjects=5, per_subject=10)
+    bundle = build_templates(
+        seg, feature_level=3, key_mode=KeyMode.PER_SUBJECT, denoise=False,
+    )
+    result = cross_validate_classifier_multiseed(
+        bundle, "LR", build_classifier("LR"),
+        n_folds=3, split_seeds=(42, 43), n_jobs=1,
+        param_grid=build_param_grid("LR"),
+    )
+    assert result.n_folds == 6
     assert np.all(np.isfinite(result.per_metric_values("accuracy")))

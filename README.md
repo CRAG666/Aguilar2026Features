@@ -92,11 +92,50 @@ tests/
 uv sync                                   # materialise the pinned environment
 pytest                                    # run the test suite
 
-# experiments
-python scripts/run_experiment.py -v                       # id + verification
-python scripts/run_experiment.py --all -v                 # + cancelability/keysens/inversion/DET
-python scripts/run_experiment.py --max-subjects 8 --cv-folds 3 --feature-levels 4 -v
+# experiments — set PYTHONHASHSEED for bit-for-bit reproducibility
+PYTHONHASHSEED=42 python scripts/run_experiment.py -v             # id + verification
+PYTHONHASHSEED=42 python scripts/run_experiment.py --all -v       # everything
+PYTHONHASHSEED=42 python scripts/run_experiment.py --max-subjects 8 --cv-folds 3 --feature-levels 4 -v
+
+# publication-grade options
+python scripts/run_experiment.py --tune -v             # nested-CV hyperparameter tuning (unbiased)
+python scripts/run_experiment.py --significance -v     # paired tests + BH multiple-comparison control
+python scripts/run_experiment.py --subject-holdout -v  # unseen-subject (quasi-external) verification
 ```
+
+Each run writes a `results/run_manifest.json` provenance record (git SHA, full
+args, dependency versions, `uv.lock` hash, dataset shape) so any CSV can be tied
+back to the exact code and environment that produced it.
+
+## Scientific scope & limitations (read before citing numbers)
+
+These bound what the reported figures support; the experiment driver implements
+the machinery, but the claims must be stated at the right altitude for a Q1 venue.
+
+* **Single-session dataset.** MIMIC-100 provides essentially one continuous
+  recording per subject. Group-aware CV with temporal blocks
+  (`StratifiedGroupKFold` over `temporal_block_groups`) removes adjacent-segment
+  leakage, but train and test still come from the **same acquisition session**.
+  Intra-session ECG/PPG biometric scores are known to be optimistic (the model
+  can lean on session-specific physiology/sensor placement), so the headline
+  recognition numbers are an **upper bound on within-session performance**, not a
+  cross-session generalisation claim. The `--subject-holdout` block adds
+  unseen-*subject* verification, but a true **cross-session** validation requires
+  a multi-session cohort and is left as the primary external-validation gap.
+* **Hyperparameters.** The fixed classifier configurations are reference
+  centres; report *tuned* numbers from `--tune` (nested CV) when claiming a model
+  beats another, or state explicitly that defaults were fixed a priori without
+  data-driven selection on this cohort.
+* **Non-invertibility is a linear-attack bound.** The reconstruction in
+  `mwf.non_invertibility` is the closed-form min-norm (ECG) / IoM-winner (PPG)
+  inverse — a **lower bound on attacker capability**. A learning- or
+  optimisation-based inversion (Mai et al. 2019, gradient inversion) can recover
+  more; the leakage figures describe the linear family only.
+* **Statistical reporting.** Identification, verification, stolen-token,
+  cancelability and non-invertibility metrics now carry CIs (Nadeau-Bengio for
+  CV folds; percentile bootstrap for pooled-score EER, `D_↔^sys`, diversity and
+  the leakage gap). Classifier comparisons are FDR-controlled
+  (Benjamini-Hochberg) across the full grid via `--significance`.
 
 Outputs land under `results/`: CSVs (`metrics.csv`, `verification.csv`,
 `cancelability.csv`, `key_sensitivity.csv`, `inversion.csv`, `stolen_token.csv`,

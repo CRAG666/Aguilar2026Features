@@ -43,7 +43,7 @@ from .constants import (
 from .dataset import BiometricSegments
 from .feature_transform import transform_multimodal_batch
 from .features import extract_features_batch
-from .operating_curves import operating_points
+from .operating_curves import bootstrap_eer_ci, operating_points
 from .pipeline import _token_for_label, preprocess_signals
 from .rng import make_rng
 from .scoring import compute_subject_centroids, cosine_score_matrix, l2_normalise, znorm
@@ -60,10 +60,13 @@ class StolenTokenResult:
     """Worst-case (stolen-key) verification summary.
 
     Attributes:
-        n_victims: Enrolled subjects exercised as verification targets.
+        n_victims: Enrolled subjects actually exercised as verification targets
+            (subjects with ≥ 2 segments, capped by ``max_victims``).
         n_genuine: Genuine score count (victim queries vs own enrolment).
         n_impostor: Impostor score count (other subjects under the victim token).
         eer: Equal-error rate with the key neutralised — pure-biometric EER.
+        eer_ci_low: Lower 95 % percentile-bootstrap bound on the EER.
+        eer_ci_high: Upper 95 % percentile-bootstrap bound on the EER.
         decidability: Daugman's ``d'`` of the pooled scores.
         genuine_mean: Mean genuine score.
         impostor_mean: Mean impostor score.
@@ -74,10 +77,43 @@ class StolenTokenResult:
     n_genuine: int
     n_impostor: int
     eer: float
+    eer_ci_low: float
+    eer_ci_high: float
     decidability: float
     genuine_mean: float
     impostor_mean: float
     operating_points: dict[str, float]
+
+
+def _split_impostor_cohort(
+    other_idx: NDArray[np.int64],
+    labels: NDArray[np.int64],
+    rng: np.random.Generator,
+) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+    """Split impostor segment indices into a Z-norm cohort and a scored set.
+
+    The split is by *subject* (never by segment) so no subject straddles the two
+    halves — the cohort that estimates the normalisation statistics shares no
+    identity with the impostors those statistics are applied to.
+
+    Args:
+        other_idx: Segment indices of all non-victim (impostor) segments.
+        labels: Full label array.
+        rng: Seeded generator for the deterministic subject split.
+
+    Returns:
+        Tuple ``(cohort_idx, scored_idx)``. With only one impostor subject the
+        split is impossible, so both fall back to ``other_idx`` (the degenerate
+        single-subject case; immaterial on a real cohort).
+    """
+    other_subjects = np.unique(labels[other_idx])
+    if other_subjects.size < 2:
+        return other_idx, other_idx
+    perm = rng.permutation(other_subjects.size)
+    n_cohort = max(1, other_subjects.size // 2)
+    cohort_subjects = other_subjects[perm[:n_cohort]]
+    in_cohort = np.isin(labels[other_idx], cohort_subjects)
+    return other_idx[in_cohort], other_idx[~in_cohort]
 
 
 def stolen_token_score_pools(
@@ -119,9 +155,10 @@ def stolen_token_score_pools(
         enrol_fraction: Fraction of a victim's segments used for enrolment.
         seed: Master RNG seed for victim subsampling and enrol/query split.
         score_norm: ``None`` for raw cosine, or ``"znorm"`` to z-normalise each
-            victim's genuine and impostor scores against that victim's impostor
-            cohort before pooling (improves threshold consistency across
-            centroids).
+            victim's genuine and impostor scores against a **held-out** impostor
+            cohort (disjoint impostor subjects) before pooling. The disjoint
+            cohort is what makes z-norm honest — normalising against the scored
+            impostors themselves would deflate the EER by construction.
         config: Optional :class:`PipelineConfig` overriding feature/projection knobs.
 
     Returns:
@@ -181,10 +218,20 @@ def stolen_token_score_pools(
 
         centroid, _ = compute_subject_centroids(feats_n[enrol_idx], labels[enrol_idx])
         gen = cosine_score_matrix(feats_n[query_idx], centroid).ravel()
-        imp = cosine_score_matrix(feats_n[~victim_mask], centroid).ravel()
+        other_idx = np.flatnonzero(~victim_mask)
         if score_norm == "znorm":
-            cohort = imp
-            gen, imp = znorm(gen, cohort), znorm(imp, cohort)
+            # Z-norm statistics MUST come from an impostor cohort disjoint from
+            # the scored impostors; estimating μ/σ from the very scores being
+            # normalised (znorm(imp, imp)) forces the impostor distribution to
+            # mean 0 / unit std by construction and optimistically deflates the
+            # EER. Split the impostor *subjects* into a held-out cohort (μ/σ) and
+            # a disjoint scored set, so the reported EER is honest.
+            cohort_idx, scored_idx = _split_impostor_cohort(other_idx, labels, rng)
+            cohort_scores = cosine_score_matrix(feats_n[cohort_idx], centroid).ravel()
+            imp = cosine_score_matrix(feats_n[scored_idx], centroid).ravel()
+            gen, imp = znorm(gen, cohort_scores), znorm(imp, cohort_scores)
+        else:
+            imp = cosine_score_matrix(feats_n[other_idx], centroid).ravel()
         genuine_pool.append(gen)
         impostor_pool.append(imp)
 
@@ -210,14 +257,22 @@ def stolen_token_verification(
     """
     genuine, impostor = stolen_token_score_pools(segments, **kwargs)  # type: ignore[arg-type]
     stats = get_eer_stats(genuine, impostor)
-    n_victims = int(np.unique(segments.labels).size)
+    # Count only subjects actually exercised (≥ 2 segments), capped by max_victims,
+    # rather than every label — victims with a single segment are skipped in the
+    # pooling loop and must not inflate the reported victim count.
+    _, seg_counts = np.unique(segments.labels, return_counts=True)
+    n_victims = int(np.count_nonzero(seg_counts >= _MIN_VICTIM_SEGMENTS))
     if kwargs.get("max_victims") is not None:
         n_victims = min(n_victims, int(kwargs["max_victims"]))  # type: ignore[arg-type]
+    eer_seed = int(kwargs.get("seed", DEFAULT_SEED))  # type: ignore[arg-type]
+    eer_ci_low, eer_ci_high = bootstrap_eer_ci(genuine, impostor, seed=eer_seed)
     result = StolenTokenResult(
         n_victims=n_victims,
         n_genuine=int(genuine.size),
         n_impostor=int(impostor.size),
         eer=float(stats.eer),
+        eer_ci_low=eer_ci_low,
+        eer_ci_high=eer_ci_high,
         decidability=float(stats.decidability),
         genuine_mean=float(stats.gmean),
         impostor_mean=float(stats.imean),
