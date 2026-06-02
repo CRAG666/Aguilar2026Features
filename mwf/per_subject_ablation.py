@@ -111,12 +111,11 @@ def _group_token_map(
     shuffled = rng.permutation(subjects)
     n_groups = max(1, int(np.ceil(n / size)))
     groups = np.array_split(shuffled, n_groups)
-    token_of: dict[int, str] = {}
-    for g_idx, group in enumerate(groups):
-        token = f"ABL_GROUP_{group_size:03d}_{g_idx:03d}"
-        for s in group:
-            token_of[int(s)] = token
-    return token_of
+    return {
+        int(s): f"ABL_GROUP_{group_size:03d}_{g_idx:03d}"
+        for g_idx, group in enumerate(groups)
+        for s in group
+    }
 
 
 def _pair_pools(

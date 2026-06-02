@@ -29,16 +29,25 @@ def make_decision_tree() -> DecisionTreeClassifier:
 
 
 def make_svm() -> SVC:
-    """Build the reference RBF SVM classifier with probability estimates.
+    """Build the reference RBF SVM classifier.
+
+    ``probability=False``: the reported identification metrics (macro AUC, EER,
+    AP) are all computed one-vs-rest **per class**, which only needs a monotonic
+    per-class score, not a calibrated, sum-to-one posterior. The scoring layer
+    (:func:`mwf.pipeline.class_score_matrix`) falls back to ``decision_function``
+    for SVM, so Platt calibration — whose internal 5-fold CV makes a probability
+    SVM roughly an order of magnitude slower to fit — is pure overhead here and
+    is dropped. Rank-based metrics are invariant to the swap, so the numbers are
+    unchanged in expectation.
 
     Returns:
-        A seeded :class:`SVC` configured with ``C=275`` and ``probability=True``.
+        A seeded :class:`SVC` configured with ``C=275`` (no probability layer).
     """
     return SVC(
         C=275,
         gamma="scale",
         kernel="rbf",
-        probability=True,
+        probability=False,
         random_state=DEFAULT_RANDOM_STATE,
     )
 

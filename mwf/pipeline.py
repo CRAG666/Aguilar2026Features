@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache
-from typing import Final
+from itertools import islice
+from typing import Final, NamedTuple
 
 import numpy as np
 from joblib import Parallel, delayed, parallel_config
@@ -306,17 +307,39 @@ def build_templates(
     )
 
 
-def _score_matrix(estimator: ClassifierMixin, x: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Return the ``predict_proba`` score matrix as ``float64``.
+def class_score_matrix(
+    estimator: ClassifierMixin, x: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Return a ``(n, n_classes)`` per-class score matrix as ``float64``.
+
+    Prefers ``predict_proba`` when the estimator exposes it; otherwise falls
+    back to ``decision_function``. Every downstream identification metric
+    (macro AUC, EER, AP) and the CMC rank accuracies are computed one-vs-rest
+    per class, so they need only a per-class score that ranks samples within a
+    column — not a calibrated, sum-to-one posterior. This lets the uncalibrated
+    SVM (``probability=False``) be scored through its decision function without
+    changing any reported number, while probability classifiers keep their
+    posteriors. The 1-D binary ``decision_function`` is expanded to the two
+    class-aligned columns ``[-score, +score]``.
 
     Args:
-        estimator: Fitted classifier exposing ``predict_proba``.
+        estimator: Fitted classifier (or pipeline / search) exposing either
+            ``predict_proba`` or ``decision_function``.
         x: ``(n, d)`` feature matrix.
 
     Returns:
-        ``(n, n_classes)`` probability matrix.
+        ``(n, n_classes)`` score matrix whose columns align with ``classes_``.
     """
-    return np.asarray(estimator.predict_proba(x), dtype=np.float64)
+    if hasattr(estimator, "predict_proba"):
+        return np.asarray(estimator.predict_proba(x), dtype=np.float64)
+    scores = np.asarray(estimator.decision_function(x), dtype=np.float64)
+    if scores.ndim == 1:  # binary one-vs-rest → two class-aligned columns
+        scores = np.column_stack([-scores, scores])
+    return scores
+
+
+# Backwards-compatible private alias for the in-module call sites.
+_score_matrix = class_score_matrix
 
 
 DEFAULT_INNER_FOLDS: Final[int] = 3
@@ -529,6 +552,63 @@ def _fit_eval_fold_full(
     return FoldEvaluation(metrics=metrics, rank_accuracies=rank_acc)
 
 
+class _FoldJob(NamedTuple):
+    """One self-contained outer-fold fit/evaluate unit.
+
+    Carries everything a worker needs so the whole CV grid can be flattened into
+    a single job list and scheduled by one pool. ``features``/``labels``/``groups``
+    are held as the *same* array objects across the jobs of a bundle so joblib
+    memory-maps each matrix once instead of re-pickling it per fold.
+    """
+
+    features: NDArray[np.float64]
+    labels: NDArray[np.int64]
+    train_idx: NDArray[np.int64]
+    test_idx: NDArray[np.int64]
+    classifier: ClassifierMixin
+    param_grid: Mapping[str, list] | None
+    groups: NDArray[np.int64] | None
+
+
+def _evaluate_fold_jobs(
+    jobs: Sequence[_FoldJob], *, ranks: tuple[int, ...], n_jobs: int | None,
+) -> list[FoldEvaluation]:
+    """Evaluate fold jobs, sequentially or over one loky pool, preserving order.
+
+    The single scheduling point for every CV path: callers flatten their grid
+    into ``jobs`` and get results back in the same order, so sequential and
+    parallel execution are byte-identical.
+
+    The array fields are passed to :func:`joblib.delayed` *individually* (not as
+    the whole ``_FoldJob``): joblib only memory-maps arrays that are top-level
+    call arguments, so unpacking is what keeps each bundle's templates shared
+    read-only across workers. Do not "simplify" this by passing ``job`` directly
+    — that silently re-pickles the feature matrix on every fold.
+    """
+    effective_n_jobs = CV_N_JOBS if n_jobs is None else n_jobs
+    if effective_n_jobs == 1 or len(jobs) <= 1:
+        return [
+            _fit_eval_fold_full(
+                j.features, j.labels, j.train_idx, j.test_idx, j.classifier, ranks,
+                param_grid=j.param_grid, groups=j.groups,
+            )
+            for j in jobs
+        ]
+    # inner_max_num_threads=1 prevents CPU oversubscription (and keeps BLAS
+    # reduction orders stable for reproducibility) when workers call into
+    # multithreaded libraries.
+    with parallel_config(backend="loky", inner_max_num_threads=1):
+        return list(
+            Parallel(n_jobs=effective_n_jobs)(
+                delayed(_fit_eval_fold_full)(
+                    j.features, j.labels, j.train_idx, j.test_idx, j.classifier,
+                    ranks, j.param_grid, j.groups,
+                )
+                for j in jobs
+            )
+        )
+
+
 def cross_validate_classifier_multiseed(
     bundle: TemplateBundle,
     classifier_name: str,
@@ -563,11 +643,42 @@ def cross_validate_classifier_multiseed(
         A :class:`CrossValidationResult` whose ``fold_metrics`` /
         ``fold_extras`` flatten all ``(seed, fold)`` observations.
     """
-    effective_n_jobs = CV_N_JOBS if n_jobs is None else n_jobs
-    groups = temporal_block_groups(bundle.labels, segments_per_block=segments_per_block)
+    groups, fold_specs = _make_fold_specs(
+        bundle, n_folds=n_folds, split_seeds=split_seeds,
+        segments_per_block=segments_per_block,
+    )
+    jobs = [
+        _FoldJob(bundle.features, bundle.labels, tr, te, classifier, param_grid, groups)
+        for _seed, _fold_idx, tr, te in fold_specs
+    ]
+    fold_evals = _evaluate_fold_jobs(jobs, ranks=ranks, n_jobs=n_jobs)
+    return _assemble_cv_result(
+        classifier_name, bundle, fold_evals,
+        n_folds_per_seed=n_folds, n_split_seeds=len(split_seeds),
+    )
 
-    # Materialise every (seed, fold_idx) train/test partition deterministically
-    # in seed order.
+
+def _make_fold_specs(
+    bundle: TemplateBundle,
+    *,
+    n_folds: int,
+    split_seeds: tuple[int, ...],
+    segments_per_block: int,
+) -> tuple[
+    NDArray[np.int64],
+    list[tuple[int, int, NDArray[np.int64], NDArray[np.int64]]],
+]:
+    """Materialise every ``(seed, fold_idx, train, test)`` partition for one bundle.
+
+    Deterministic in seed order — the same partitions whether they are later
+    evaluated sequentially or fanned out across workers — so results never
+    depend on the execution schedule.
+
+    Returns:
+        Tuple ``(groups, fold_specs)``: the temporal-block group ids (reused for
+        the inner tuning split) and the per-fold train/test index arrays.
+    """
+    groups = temporal_block_groups(bundle.labels, segments_per_block=segments_per_block)
     fold_specs: list[tuple[int, int, NDArray[np.int64], NDArray[np.int64]]] = []
     for seed in split_seeds:
         splitter = stratified_group_splitter(n_splits=n_folds, random_state=seed)
@@ -575,81 +686,164 @@ def cross_validate_classifier_multiseed(
             splitter.split(bundle.features, bundle.labels, groups=groups)
         ):
             fold_specs.append((seed, fold_idx, np.asarray(train_idx), np.asarray(test_idx)))
+    return groups, fold_specs
 
-    if effective_n_jobs == 1 or len(fold_specs) <= 1:
-        fold_evals = [
-            _fit_eval_fold_full(
-                bundle.features, bundle.labels, tr, te, classifier, ranks,
-                param_grid=param_grid, groups=groups,
-            )
-            for _, _, tr, te in fold_specs
-        ]
-    else:
-        # inner_max_num_threads=1 prevents CPU oversubscription (and keeps BLAS
-        # reduction orders stable for reproducibility) when workers themselves
-        # call into multithreaded libraries.
-        with parallel_config(backend="loky", inner_max_num_threads=1):
-            fold_evals = Parallel(n_jobs=effective_n_jobs)(
-                delayed(_fit_eval_fold_full)(
-                    bundle.features,
-                    bundle.labels,
-                    tr,
-                    te,
-                    classifier,
-                    ranks,
-                    param_grid,
-                    groups,
-                )
-                for _, _, tr, te in fold_specs
-            )
 
+def _assemble_cv_result(
+    classifier_name: str,
+    bundle: TemplateBundle,
+    fold_evals: Sequence[FoldEvaluation],
+    *,
+    n_folds_per_seed: int,
+    n_split_seeds: int,
+) -> CrossValidationResult:
+    """Aggregate per-fold evaluations into a :class:`CrossValidationResult`.
+
+    Shared by :func:`cross_validate_classifier_multiseed` and
+    :func:`cross_validate_tasks` so both produce byte-identical aggregates
+    regardless of how the folds were scheduled.
+    """
     fold_metrics = [fe.metrics for fe in fold_evals]
     fold_extras = [dict(fe.rank_accuracies) for fe in fold_evals]
 
-    for (seed, fold_idx, _, _), m, fe in zip(fold_specs, fold_metrics, fold_extras):
-        logger.debug(
-            "[%s | %d feats | %s | seed %d fold %d] Acc=%.4f AUC=%.4f EER=%.4f F1=%.4f R1=%.4f",
-            classifier_name,
-            bundle.features.shape[1],
-            bundle.key_mode.value,
-            seed,
-            fold_idx,
-            m.accuracy,
-            m.auc,
-            m.eer,
-            m.f1,
-            fe.get("rank_1_accuracy", float("nan")),
-        )
-
     acc_vals = np.array([m.accuracy for m in fold_metrics], dtype=np.float64)
     f1_vals = np.array([m.f1 for m in fold_metrics], dtype=np.float64)
-    r1_vals = np.array([fe.get("rank_1_accuracy", float("nan")) for fe in fold_extras], dtype=np.float64)
+    r1_vals = np.array(
+        [fe.get("rank_1_accuracy", float("nan")) for fe in fold_extras], dtype=np.float64
+    )
     logger.info(
         "[%s | %d feats | %s] %d seeds × %d folds = %d obs | Acc=%.4f±%.4f F1=%.4f±%.4f R1=%.4f±%.4f",
         classifier_name,
         bundle.features.shape[1],
         bundle.key_mode.value,
-        len(split_seeds),
-        n_folds,
+        n_split_seeds,
+        n_folds_per_seed,
         len(fold_metrics),
-        float(np.nanmean(acc_vals)),
-        float(np.nanstd(acc_vals, ddof=1)),
-        float(np.nanmean(f1_vals)),
-        float(np.nanstd(f1_vals, ddof=1)),
-        float(np.nanmean(r1_vals)),
-        float(np.nanstd(r1_vals, ddof=1)),
+        float(np.nanmean(acc_vals)) if acc_vals.size else float("nan"),
+        float(np.nanstd(acc_vals, ddof=1)) if acc_vals.size > 1 else 0.0,
+        float(np.nanmean(f1_vals)) if f1_vals.size else float("nan"),
+        float(np.nanstd(f1_vals, ddof=1)) if f1_vals.size > 1 else 0.0,
+        float(np.nanmean(r1_vals)) if r1_vals.size else float("nan"),
+        float(np.nanstd(r1_vals, ddof=1)) if r1_vals.size > 1 else 0.0,
     )
     return CrossValidationResult(
         classifier=classifier_name,
         n_features=bundle.features.shape[1],
         key_mode=bundle.key_mode,
         fold_metrics=tuple(fold_metrics),
-        n_folds_per_seed=n_folds,
+        n_folds_per_seed=n_folds_per_seed,
         fold_extras=tuple(fold_extras),
     )
 
 
+def _single_threaded(estimator: ClassifierMixin) -> ClassifierMixin:
+    """Clone ``estimator`` forcing ``n_jobs=1`` when it exposes that parameter.
+
+    When the outer fold pool already saturates every core, an estimator that
+    *also* parallelises internally (e.g. ``RandomForestClassifier(n_jobs=-1)``)
+    oversubscribes the CPU — dozens of threads fighting for 12 cores, which is
+    slower than one thread per worker. ``n_jobs`` only governs parallelism, not
+    the fitted model (the trees are fixed by ``random_state``), so forcing it to
+    1 leaves every reported number identical while removing the contention.
+    """
+    est = clone(estimator)
+    if "n_jobs" in est.get_params():
+        est.set_params(n_jobs=1)
+    return est
+
+
+@dataclass(frozen=True, slots=True)
+class CVTask:
+    """One independent identification CV evaluation (regime × level × classifier).
+
+    Attributes:
+        key: Opaque caller-supplied identifier used to map a result back to its
+            grouping (e.g. ``(regime, level, classifier_name)``).
+        bundle: Templates and labels to evaluate.
+        classifier_name: Label used in logs and the result.
+        classifier: Classifier prototype (cloned per fold).
+        param_grid: Optional ``clf__``-prefixed grid enabling per-fold nested CV.
+    """
+
+    key: Hashable
+    bundle: TemplateBundle
+    classifier_name: str
+    classifier: ClassifierMixin
+    param_grid: Mapping[str, list] | None = None
+
+
+def cross_validate_tasks(
+    tasks: Sequence[CVTask],
+    *,
+    n_folds: int = DEFAULT_N_FOLDS,
+    split_seeds: tuple[int, ...] = DEFAULT_SPLIT_SEEDS,
+    segments_per_block: int = DEFAULT_SEGMENTS_PER_BLOCK,
+    ranks: tuple[int, ...] = DEFAULT_RANKS,
+    n_jobs: int | None = None,
+) -> list[CrossValidationResult]:
+    """Cross-validate many ``(bundle, classifier)`` tasks over **one** worker pool.
+
+    The flat list of *every* ``(task, seed, fold)`` evaluation across all tasks
+    is submitted in a single :class:`joblib.Parallel` call, so the pool stays
+    full until the very end — one scheduling tail for the whole grid instead of
+    one per task. This is the genuine win over calling
+    :func:`cross_validate_classifier_multiseed` in a Python loop, where each call
+    only parallelises its own ``n_folds × n_seeds`` folds and leaves cores idle
+    on every task's tail.
+
+    Determinism / rigour: fold partitions come from :func:`_make_fold_specs`
+    (seed-ordered, schedule-independent), each task's classifier is run
+    single-threaded to avoid nested-pool oversubscription (no effect on the
+    fitted model), and results are regrouped in task order — so the returned
+    list is element-for-element identical to evaluating each task on its own.
+    joblib memory-maps each distinct feature matrix once and shares it read-only
+    across the workers, so passing the same ``bundle`` to several tasks does not
+    re-serialise its templates per fold.
+
+    Args:
+        tasks: Independent evaluations; the result list aligns with this order.
+        n_folds: Folds per seed.
+        split_seeds: Seeds driving the repeated CV.
+        segments_per_block: Block size for temporal grouping.
+        ranks: Ranks for the per-fold CMC accuracies.
+        n_jobs: Worker count; ``None`` reads :data:`CV_N_JOBS` (``1`` runs the
+            flat list sequentially).
+
+    Returns:
+        One :class:`CrossValidationResult` per task, in input order.
+    """
+    tasks = list(tasks)
+
+    # Flatten every (task, seed, fold) into one job list. The classifier is run
+    # single-threaded so the outer pool — not a nested one — owns the cores; the
+    # bundle's arrays are reused by reference so joblib memmaps each matrix once.
+    jobs: list[_FoldJob] = []
+    fold_counts: list[int] = []
+    for task in tasks:
+        groups, specs = _make_fold_specs(
+            task.bundle, n_folds=n_folds, split_seeds=split_seeds,
+            segments_per_block=segments_per_block,
+        )
+        clf = _single_threaded(task.classifier)
+        fold_counts.append(len(specs))
+        jobs.extend(
+            _FoldJob(task.bundle.features, task.bundle.labels, tr, te, clf, task.param_grid, groups)
+            for _seed, _fold_idx, tr, te in specs
+        )
+
+    evals = iter(_evaluate_fold_jobs(jobs, ranks=ranks, n_jobs=n_jobs))
+    # Regroup the ordered evaluations back into one result per task.
+    return [
+        _assemble_cv_result(
+            task.classifier_name, task.bundle, list(islice(evals, count)),
+            n_folds_per_seed=n_folds, n_split_seeds=len(split_seeds),
+        )
+        for task, count in zip(tasks, fold_counts)
+    ]
+
+
 __all__ = [
+    "CVTask",
     "CrossValidationResult",
     "DEFAULT_SPLIT_SEEDS",
     "FoldEvaluation",
@@ -657,7 +851,9 @@ __all__ = [
     "SHARED_TOKEN",
     "TemplateBundle",
     "build_templates",
+    "class_score_matrix",
     "cross_validate_classifier_multiseed",
+    "cross_validate_tasks",
     "feature_dimension",
     "make_pipeline",
     "preprocess_signals",

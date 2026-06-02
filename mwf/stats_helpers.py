@@ -44,27 +44,19 @@ def bootstrap_ci_mean(
     """
     if samples.size < 2:
         return float("nan"), float("nan")
+    kwargs = dict(
+        statistic=np.mean,
+        confidence_level=level,
+        n_resamples=n_resamples,
+        random_state=seed,
+    )
     try:
-        res = bootstrap(
-            (samples,),
-            statistic=np.mean,
-            confidence_level=level,
-            n_resamples=n_resamples,
-            method="BCa",
-            random_state=seed,
-        )
+        res = bootstrap((samples,), method="BCa", **kwargs)
     except (ValueError, RuntimeError):
         # BCa is undefined for degenerate samples (e.g. near-constant
         # observations make the acceleration term blow up); scipy raises
         # ValueError there. Fall back to the always-defined percentile CI.
-        res = bootstrap(
-            (samples,),
-            statistic=np.mean,
-            confidence_level=level,
-            n_resamples=n_resamples,
-            method="percentile",
-            random_state=seed,
-        )
+        res = bootstrap((samples,), method="percentile", **kwargs)
     return float(res.confidence_interval.low), float(res.confidence_interval.high)
 
 

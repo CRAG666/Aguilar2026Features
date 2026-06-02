@@ -17,6 +17,7 @@ is reproducible and citable. Cleaning preserves the segment length, so the
 from __future__ import annotations
 
 import warnings
+from collections.abc import Callable
 from typing import Final
 
 import neurokit2 as nk
@@ -47,6 +48,29 @@ def _validate(signal: NDArray[np.float64], sampling_rate: int) -> None:
         raise ValueError(f"sampling_rate must be > 0; got {sampling_rate}.")
 
 
+# NeuroKit cleaners share one signature ``(signal, sampling_rate=, method=)`` and
+# one calling convention (suppress their chatty warnings, coerce to float64).
+_NkCleaner = Callable[..., NDArray[np.float64]]
+
+
+def _clean_one(
+    signal: NDArray[np.float64],
+    sampling_rate: int,
+    method: str,
+    cleaner: _NkCleaner,
+) -> NDArray[np.float64]:
+    """Validate, then run one NeuroKit cleaner with warnings suppressed."""
+    _validate(signal, sampling_rate)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cleaned = cleaner(
+            np.asarray(signal, dtype=np.float64),
+            sampling_rate=sampling_rate,
+            method=method,
+        )
+    return np.asarray(cleaned, dtype=np.float64)
+
+
 def clean_ecg(
     signal: NDArray[np.float64],
     sampling_rate: int,
@@ -65,15 +89,7 @@ def clean_ecg(
     Raises:
         ValueError: If ``signal`` is not 1-D or ``sampling_rate <= 0``.
     """
-    _validate(signal, sampling_rate)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        cleaned = nk.ecg_clean(
-            np.asarray(signal, dtype=np.float64),
-            sampling_rate=sampling_rate,
-            method=method,
-        )
-    return np.asarray(cleaned, dtype=np.float64)
+    return _clean_one(signal, sampling_rate, method, nk.ecg_clean)
 
 
 def clean_ppg(
@@ -94,15 +110,7 @@ def clean_ppg(
     Raises:
         ValueError: If ``signal`` is not 1-D or ``sampling_rate <= 0``.
     """
-    _validate(signal, sampling_rate)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        cleaned = nk.ppg_clean(
-            np.asarray(signal, dtype=np.float64),
-            sampling_rate=sampling_rate,
-            method=method,
-        )
-    return np.asarray(cleaned, dtype=np.float64)
+    return _clean_one(signal, sampling_rate, method, nk.ppg_clean)
 
 
 def _clean_chunk(
@@ -127,6 +135,22 @@ def _clean_chunk(
     ])
 
 
+def _clean_batch(
+    signals: NDArray[np.float64],
+    clean_one: Callable[..., NDArray[np.float64]],
+    sampling_rate: int,
+    method: str,
+    n_jobs: int | None,
+) -> NDArray[np.float64]:
+    """Row-parallel cleaning scaffold shared by the ECG/PPG batch entry points."""
+    ensure_2d_batch(signals, name="signals")
+
+    def _worker(chunk: NDArray[np.float64]) -> NDArray[np.float64]:
+        return _clean_chunk(chunk, clean_one, sampling_rate, method)
+
+    return parallel_row_map(signals, _worker, n_jobs=n_jobs)
+
+
 def clean_ecg_batch(
     signals: NDArray[np.float64],
     sampling_rate: int,
@@ -144,12 +168,7 @@ def clean_ecg_batch(
     Returns:
         ``(B, N)`` cleaned array in input row order.
     """
-    ensure_2d_batch(signals, name="signals")
-
-    def _worker(chunk: NDArray[np.float64]) -> NDArray[np.float64]:
-        return _clean_chunk(chunk, clean_ecg, sampling_rate, method)
-
-    return parallel_row_map(signals, _worker, n_jobs=n_jobs)
+    return _clean_batch(signals, clean_ecg, sampling_rate, method, n_jobs)
 
 
 def clean_ppg_batch(
@@ -169,12 +188,7 @@ def clean_ppg_batch(
     Returns:
         ``(B, N)`` cleaned array in input row order.
     """
-    ensure_2d_batch(signals, name="signals")
-
-    def _worker(chunk: NDArray[np.float64]) -> NDArray[np.float64]:
-        return _clean_chunk(chunk, clean_ppg, sampling_rate, method)
-
-    return parallel_row_map(signals, _worker, n_jobs=n_jobs)
+    return _clean_batch(signals, clean_ppg, sampling_rate, method, n_jobs)
 
 
 __all__ = [

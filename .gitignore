@@ -47,6 +47,7 @@ __pypackages__/
 # OS / editor noise
 .DS_Store
 *.swp
+<<<<<<< HEAD
 tempCodeRunnerFile.py
 
 # IDEs

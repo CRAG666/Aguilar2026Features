@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
-from typing import Final
+from collections.abc import Callable, Sequence
+from typing import Final, TypeVar
 
 import numpy as np
 from joblib import Parallel, delayed
 from numpy.typing import NDArray
+
+T = TypeVar("T")
+R = TypeVar("R")
 
 # Single environment variable controls per-row batch parallelism for every
 # consumer in the package. ``-1`` means "all logical cores"; ``1`` recovers
@@ -53,9 +56,50 @@ def parallel_row_map(
     return np.concatenate(results, axis=0)
 
 
+def parallel_map(
+    items: Sequence[T],
+    worker: Callable[[T], R],
+    *,
+    n_jobs: int | None = None,
+    parallel_threshold: int = 2,
+) -> list[R]:
+    """Apply ``worker`` to each item of ``items``, preserving input order.
+
+    A thin order-preserving wrapper over :class:`joblib.Parallel` for the
+    embarrassingly-parallel per-item loops of the security/leakage suite (one
+    independent victim / segment / probe per item). joblib returns results in
+    submission order regardless of completion order, so the output is identical
+    — element for element — to the sequential ``[worker(x) for x in items]``;
+    parallelism is therefore a pure wall-clock optimisation with no effect on
+    any reported number. Only use it for workers whose result depends solely on
+    their own item (no shared RNG state mutated across iterations).
+
+    Small inputs or ``n_jobs == 1`` run sequentially with no joblib overhead.
+
+    Args:
+        items: Independent work items, in the order their results are wanted.
+        worker: Pure callable mapping one item to its result.
+        n_jobs: Worker count; ``None`` reads :data:`DEFAULT_BATCH_N_JOBS`.
+        parallel_threshold: Minimum item count that triggers the joblib pool.
+
+    Returns:
+        ``[worker(x) for x in items]``, computed in parallel when worthwhile.
+    """
+    items = list(items)
+    effective_n_jobs = DEFAULT_BATCH_N_JOBS if n_jobs is None else n_jobs
+    if effective_n_jobs == 1 or len(items) < parallel_threshold:
+        return [worker(x) for x in items]
+    return list(
+        Parallel(n_jobs=effective_n_jobs, prefer="processes")(
+            delayed(worker)(x) for x in items
+        )
+    )
+
+
 __all__ = [
     "BATCH_N_JOBS_ENV_VAR",
     "DEFAULT_BATCH_N_JOBS",
     "DEFAULT_PARALLEL_THRESHOLD",
+    "parallel_map",
     "parallel_row_map",
 ]

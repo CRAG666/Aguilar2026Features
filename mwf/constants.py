@@ -12,7 +12,13 @@ from typing import Final
 DEFAULT_SEED: Final[int] = 42
 DEFAULT_N_FOLDS: Final[int] = 5
 DEFAULT_SEGMENTS_PER_BLOCK: Final[int] = 2
-DEFAULT_SPLIT_SEEDS: Final[tuple[int, ...]] = (42, 43, 44, 45, 46)
+# Repeated-CV seeds: each seed reshuffles the k-fold partition, and the
+# Nadeau-Bengio CI aggregates over all seed×fold observations. Three seeds
+# (15 folds at k=5) already give a stable mean and a tight corrected CI; the
+# variance reduction from a 4th/5th seed is marginal and not worth the ~linear
+# runtime cost of the nested-CV tuning grid. Override with --split-seeds to
+# restore the previous 5-seed protocol when extra statistical power is wanted.
+DEFAULT_SPLIT_SEEDS: Final[tuple[int, ...]] = (42, 43, 44)
 
 # ---------------------------------------------------------------------------
 # Wavelet / DWT configuration

@@ -9,7 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 from sklearn.model_selection import GroupShuffleSplit
 
-from .constants import DEFAULT_SEED
+from .constants import DEFAULT_SEED, DEFAULT_SPLIT_SEEDS
 from .dataset import BiometricSegments
 
 DEFAULT_TEST_FRACTION: Final[float] = 0.20
@@ -123,7 +123,7 @@ def subject_holdout(
 def subject_holdout_multiseed(
     segments: BiometricSegments,
     test_fraction: float = DEFAULT_TEST_FRACTION,
-    seeds: tuple[int, ...] = (42, 43, 44, 45, 46),
+    seeds: tuple[int, ...] = DEFAULT_SPLIT_SEEDS,
 ) -> tuple[HoldoutSplit, ...]:
     """Run :func:`subject_holdout` once per seed.
 

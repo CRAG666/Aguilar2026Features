@@ -30,6 +30,7 @@ import subprocess
 import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
+from itertools import chain
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -51,9 +52,11 @@ from mwf import (  # noqa: E402
     METRIC_NAMES,
     benchmark,
     build_templates,
+    class_score_matrix,
     closed_set_score_pools,
     compare_classifiers,
-    cross_validate_classifier_multiseed,
+    cross_validate_tasks,
+    CVTask,
     decidability,
     det_curve_from_scores,
     evaluate,
@@ -82,6 +85,7 @@ from mwf import (  # noqa: E402
     summarise_run,
     temporal_holdout_per_subject,
 )
+from mwf.batch_utils import parallel_map  # noqa: E402
 from mwf.classifiers import (  # noqa: E402
     CLASSIFIER_NAMES,
     build_classifier,
@@ -213,6 +217,72 @@ def _save_csv(df: pd.DataFrame, path: Path) -> None:
     logger.info("Wrote %s (%d rows).", path, len(df))
 
 
+def _identification_metric_row(
+    regime_value: str,
+    feature_level: int,
+    classifier_name: str,
+    result,
+    *,
+    tuned: bool,
+) -> dict:
+    """Flatten one classifier's CV result into a ``metrics.csv`` row.
+
+    Keeps the (wide) identification schema in one place, separate from the
+    orchestration that produces the results.
+    """
+    summaries = summarise_run(result)
+    row: dict = {
+        "regime": regime_value,
+        "feature_level": feature_level,
+        "n_template_dims": result.n_features,
+        "classifier": classifier_name,
+        "n_folds": result.n_folds,
+        "tuned": tuned,
+    }
+    for m in METRIC_NAMES:
+        s = summaries[m]
+        row[f"{m}_mean"], row[f"{m}_std"] = s.mean, s.std
+        row[f"{m}_ci_lo"], row[f"{m}_ci_hi"] = s.ci_low, s.ci_high
+    for k in RANK_TARGETS:
+        row[f"rank_{k}_accuracy_mean"] = float(
+            np.nanmean(result.per_extra_values(f"rank_{k}_accuracy"))
+        )
+    return row
+
+
+def _verification_metric_row(
+    regime_value: str,
+    feature_level: int,
+    mode: str,
+    ver,
+    *,
+    n_folds: int,
+) -> dict:
+    """Flatten one verification CV result into a ``verification.csv`` row."""
+    eer = ver.eer_values()
+    deci = ver.decidability_values()
+    finite_eer = eer[np.isfinite(eer)]
+    # Verification EER gets the same Nadeau-Bengio corrected CI as identification,
+    # so the two protocols are reported at equal rigour.
+    eer_ci_lo, eer_ci_hi = (
+        nadeau_bengio_ci_mean(finite_eer, n_folds=n_folds)
+        if finite_eer.size > 1 else (float("nan"), float("nan"))
+    )
+    return {
+        "regime": regime_value,
+        "feature_level": feature_level,
+        "n_template_dims": ver.n_features,
+        "verification_mode": mode,
+        "n_folds": ver.n_folds,
+        "eer_mean": float(np.nanmean(eer)),
+        "eer_std": float(np.nanstd(eer, ddof=1)) if eer.size > 1 else 0.0,
+        "eer_ci_lo": eer_ci_lo,
+        "eer_ci_hi": eer_ci_hi,
+        "decidability_mean": float(np.nanmean(deci)),
+        "decidability_std": float(np.nanstd(deci, ddof=1)) if deci.size > 1 else 0.0,
+    }
+
+
 def _identification_and_verification(
     segments: BiometricSegments,
     *,
@@ -237,74 +307,73 @@ def _identification_and_verification(
         Tuple ``(identification_df, verification_df, id_results)``. ``id_results``
         maps ``"{regime}@L{level}"`` → ``{classifier: CrossValidationResult}`` so
         the paired significance tests can compare classifiers on identical folds.
+
+    Parallelism: the templates for every ``(regime, level)`` are built once and
+    reused. The whole identification grid (regime × level × classifier) is then
+    cross-validated through a single flat worker pool (:func:`cross_validate_tasks`)
+    so cores stay busy until the last fold, and the independent verification CVs
+    fan out across cores too. Row order, fold splits and aggregates are identical
+    to the previous sequential nested loops.
     """
     id_rows: list[dict] = []
     ver_rows: list[dict] = []
     id_results: dict[str, dict[str, object]] = {}
-    for regime in regimes:
-        for level in feature_levels:
-            bundle = build_templates(
-                segments,
-                feature_level=level,
-                projection_ratio=projection_ratio,
-                binarise=binarise,
-                key_mode=regime,
+
+    # Build the templates for each (regime, level) once; reused by both protocols
+    # (and shared read-only across the worker pool via joblib's memmap).
+    bundles = {
+        (regime, level): build_templates(
+            segments, feature_level=level, projection_ratio=projection_ratio,
+            binarise=binarise, key_mode=regime,
+        )
+        for regime in regimes
+        for level in feature_levels
+    }
+
+    if run_identification:
+        # One task per (regime, level, classifier); a single pool covers them all.
+        tasks = [
+            CVTask(
+                key=(regime, level, name),
+                bundle=bundles[(regime, level)],
+                classifier_name=name,
+                classifier=build_classifier(name),
+                param_grid=build_param_grid(name) if tune else None,
             )
-            if run_identification:
-                group_key = f"{regime.value}@L{level}"
-                id_results[group_key] = {}
-                for name in CLASSIFIER_NAMES:
-                    result = cross_validate_classifier_multiseed(
-                        bundle, name, build_classifier(name),
-                        n_folds=n_folds, split_seeds=split_seeds, ranks=RANK_TARGETS,
-                        param_grid=build_param_grid(name) if tune else None,
-                    )
-                    id_results[group_key][name] = result
-                    summaries = summarise_run(result)
-                    row = {
-                        "regime": regime.value,
-                        "feature_level": level,
-                        "n_template_dims": result.n_features,
-                        "classifier": name,
-                        "n_folds": result.n_folds,
-                        "tuned": tune,
-                    }
-                    for m in METRIC_NAMES:
-                        row[f"{m}_mean"] = summaries[m].mean
-                        row[f"{m}_std"] = summaries[m].std
-                        row[f"{m}_ci_lo"] = summaries[m].ci_low
-                        row[f"{m}_ci_hi"] = summaries[m].ci_high
-                    for k in RANK_TARGETS:
-                        row[f"rank_{k}_accuracy_mean"] = float(
-                            np.nanmean(result.per_extra_values(f"rank_{k}_accuracy"))
-                        )
-                    id_rows.append(row)
-            if run_verification:
-                for mode in ("closed_set", "open_set"):
-                    ver = run_verification_cv(bundle, mode=mode, n_folds=n_folds)
-                    eer = ver.eer_values()
-                    deci = ver.decidability_values()
-                    finite_eer = eer[np.isfinite(eer)]
-                    # Verification EER gets the same Nadeau-Bengio corrected CI as
-                    # identification, so the two protocols are reported at equal rigour.
-                    eer_ci_lo, eer_ci_hi = nadeau_bengio_ci_mean(
-                        finite_eer, n_folds=n_folds,
-                    ) if finite_eer.size > 1 else (float("nan"), float("nan"))
-                    ver_rows.append({
-                        "regime": regime.value,
-                        "feature_level": level,
-                        "n_template_dims": ver.n_features,
-                        "verification_mode": mode,
-                        "n_folds": ver.n_folds,
-                        "eer_mean": float(np.nanmean(eer)),
-                        "eer_std": float(np.nanstd(eer, ddof=1)) if eer.size > 1 else 0.0,
-                        "eer_ci_lo": eer_ci_lo,
-                        "eer_ci_hi": eer_ci_hi,
-                        "decidability_mean": float(np.nanmean(deci)),
-                        "decidability_std": (
-                            float(np.nanstd(deci, ddof=1)) if deci.size > 1 else 0.0
-                        ),
-                    })
+            for regime in regimes
+            for level in feature_levels
+            for name in CLASSIFIER_NAMES
+        ]
+        results = cross_validate_tasks(
+            tasks, n_folds=n_folds, split_seeds=split_seeds, ranks=RANK_TARGETS,
+        )
+        for task, result in zip(tasks, results):
+            regime, level, name = task.key
+            id_results.setdefault(f"{regime.value}@L{level}", {})[name] = result
+            id_rows.append(
+                _identification_metric_row(regime.value, level, name, result, tuned=tune)
+            )
+
+    if run_verification:
+        # Each (regime, level, mode) verification CV is independent → fan out.
+        # The bundle travels inside the work item (not a closure) so joblib only
+        # ships each template matrix to the worker that needs it.
+        ver_keys = [
+            (regime, level, mode)
+            for regime in regimes
+            for level in feature_levels
+            for mode in ("closed_set", "open_set")
+        ]
+        ver_items = [(bundles[(regime, level)], mode) for regime, level, mode in ver_keys]
+        vers = parallel_map(
+            ver_items,
+            lambda item: run_verification_cv(item[0], mode=item[1], n_folds=n_folds),
+        )
+        ver_rows = [
+            _verification_metric_row(regime.value, level, mode, ver, n_folds=n_folds)
+            for (regime, level, mode), ver in zip(ver_keys, vers)
+        ]
+
     return pd.DataFrame(id_rows), pd.DataFrame(ver_rows), id_results
 
 
@@ -343,8 +412,11 @@ def _key_sensitivity_df(
     idx = rng.choice(
         segments.num_segments, size=min(n_segments, segments.num_segments), replace=False,
     )
-    rows = []
-    for i in idx:
+
+    # Each segment is an independent, RNG-self-contained probe (its base token is
+    # derived from the fixed index ``i``), so the per-segment work fans out across
+    # cores with order-preserving results identical to the sequential loop.
+    def _row(i: int) -> dict:
         x = extract_features(segments.ecg[i], segments.ppg[i], level=feature_level)
         report = key_sensitivity(
             transform_fn=lambda tok: transform_multimodal(
@@ -353,8 +425,9 @@ def _key_sensitivity_df(
             base_password=f"KEY_SENS_{i}",
             n_trials=n_trials,
         )
-        rows.append({"segment": int(i), **asdict(report)})
-    return pd.DataFrame(rows)
+        return {"segment": int(i), **asdict(report)}
+
+    return pd.DataFrame(parallel_map([int(i) for i in idx], _row))
 
 
 def _inversion_df(
@@ -371,15 +444,18 @@ def _inversion_df(
         segments.num_segments, size=min(n_segments, segments.num_segments), replace=False,
     )
     half = feature_dimension(feature_level) // 2
-    rows = []
-    for i in idx:
+
+    # Per-segment leakage is independent and deterministic in the index ``i``;
+    # fan out across cores (order preserved, results bit-identical).
+    def _row(i: int) -> dict:
         x = extract_features(segments.ecg[i], segments.ppg[i], level=feature_level)
         token = f"USER_INV_{i}"
         report = multimodal_leakage_metrics(
             x[:half], x[half:], token, projection_ratio=projection_ratio,
         )
-        rows.append({"segment": int(i), "feature_level": feature_level, **asdict(report)})
-    return pd.DataFrame(rows)
+        return {"segment": int(i), "feature_level": feature_level, **asdict(report)}
+
+    return pd.DataFrame(parallel_map([int(i) for i in idx], _row))
 
 
 def _record_multiplicity_df(
@@ -402,17 +478,24 @@ def _record_multiplicity_df(
         segments.num_segments, size=min(n_segments, segments.num_segments), replace=False,
     )
     half = feature_dimension(feature_level) // 2
-    rows = []
-    for i in idx:
+
+    # Per-segment ARM recovery is independent and deterministic in ``i``; fan out
+    # across cores. Each worker returns its (segment × revocation × k) rows and
+    # the order-preserving map keeps the overall row order identical.
+    def _rows(i: int) -> list[dict]:
         x = extract_features(segments.ecg[i], segments.ppg[i], level=feature_level)
         token = f"USER_ARM_{i}"
+        out: list[dict] = []
         for revocation in (INDEPENDENT, SHARED_SUBSPACE):
             for report in record_multiplicity_leakage(
                 x[:half], token, n_templates,
                 projection_ratio=projection_ratio, revocation=revocation,
             ):
-                rows.append({"segment": int(i), "feature_level": feature_level, **asdict(report)})
-    return pd.DataFrame(rows)
+                out.append({"segment": int(i), "feature_level": feature_level, **asdict(report)})
+        return out
+
+    nested = parallel_map([int(i) for i in idx], _rows)
+    return pd.DataFrame(list(chain.from_iterable(nested)))
 
 
 def _non_invertibility_outputs(
@@ -609,7 +692,7 @@ def _holdout_df(
             for name in CLASSIFIER_NAMES:
                 pipe = make_pipeline(clone(build_classifier(name)))
                 pipe.fit(train_b.features, train_b.labels)
-                y_score = np.asarray(pipe.predict_proba(test_b.features), dtype=np.float64)
+                y_score = class_score_matrix(pipe, test_b.features)
                 classes = np.asarray(pipe.named_steps["clf"].classes_, dtype=np.int64)
                 y_pred = pipe.predict(test_b.features)
                 metrics = evaluate(test_b.labels, y_pred, y_score, classes)

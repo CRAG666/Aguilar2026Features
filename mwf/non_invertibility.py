@@ -33,13 +33,16 @@ leakage as plain BioHashing), the PPG block with
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Final
 
 import numpy as np
+from joblib import Parallel, delayed
 from numpy.typing import NDArray
 
 from . import iom
+from .batch_utils import DEFAULT_BATCH_N_JOBS
 from .operating_curves import det_curve_from_scores
 from .constants import (
     DEFAULT_BINARISE,
@@ -180,8 +183,44 @@ def _reconstruct_features(
     half = d // 2
     m_ecg = projection_dim(half, projection_ratio)
     n_hashes = iom.hash_count(half, n_hashes_ratio)
+
+    # Each row's pre-image depends only on its own (features[i], tokens[i]) and
+    # the scalar geometry below — no RNG, no cross-row state — so the rows fan
+    # out across cores in contiguous chunks and the concatenation reproduces the
+    # sequential output exactly. Deriving a fresh projection matrix per row makes
+    # this the dominant cost of the whole non-invertibility report.
+    n_jobs = DEFAULT_BATCH_N_JOBS
+    if n_jobs == 1 or n < _RECONSTRUCT_PARALLEL_THRESHOLD:
+        return _reconstruct_chunk(features, tokens, half, m_ecg, n_hashes, window)
+    n_workers = n_jobs if n_jobs > 0 else (os.cpu_count() or 1)
+    idx_chunks = np.array_split(np.arange(n), min(n_workers, n))
+    chunks = Parallel(n_jobs=n_jobs, prefer="processes")(
+        delayed(_reconstruct_chunk)(
+            features[c], [tokens[j] for j in c], half, m_ecg, n_hashes, window,
+        )
+        for c in idx_chunks
+    )
+    return np.concatenate(chunks, axis=0)
+
+
+_RECONSTRUCT_PARALLEL_THRESHOLD: Final[int] = 64
+
+
+def _reconstruct_chunk(
+    features: NDArray[np.float64],
+    tokens: list[str],
+    half: int,
+    m_ecg: int,
+    n_hashes: int,
+    window: int,
+) -> NDArray[np.float64]:
+    """Reconstruct a contiguous row-slab; the per-row kernel of the pre-image.
+
+    Pure in its arguments (no RNG, no shared state), so a worker can run it on
+    any slab in any order without affecting the concatenated result.
+    """
     out = np.empty_like(features)
-    for i in range(n):
+    for i in range(features.shape[0]):
         token = tokens[i]
         ecg = features[i, :half]
         ppg = features[i, half:]

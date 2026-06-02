@@ -356,6 +356,28 @@ def _bootstrap_key_mean_ci(
     return _percentile_ci(vals, _BOOTSTRAP_LEVEL)
 
 
+def _per_class_abs_corr(
+    a_z: NDArray[np.float64],
+    b_z: NDArray[np.float64],
+    labels: NDArray[np.int64],
+) -> NDArray[np.float64]:
+    """Per-class ``|Pearson r|`` between two column-standardised template sets.
+
+    The diversity metric of one re-issued key: for every subject, how correlated
+    its base and re-issued templates remain (lower ⇒ more diverse). Degenerate
+    (NaN) correlations are dropped.
+    """
+    corrs: list[float] = []
+    for cls in np.unique(labels):
+        mask = labels == cls
+        if mask.sum() == 0:
+            continue
+        r = _abs_pearson(a_z[mask].ravel(), b_z[mask].ravel())
+        if not np.isnan(r):
+            corrs.append(r)
+    return np.asarray(corrs, dtype=np.float64)
+
+
 def evaluate_cancelability(
     segments: BiometricSegments,
     feature_level: int = DEFAULT_FEATURE_LEVEL,
@@ -417,15 +439,9 @@ def evaluate_cancelability(
         mated_pool.append(mated)
         non_mated_pool.append(non_mated)
         reissued_z = _standardize_columns(reissued)
-        key_corrs: list[float] = []
-        for cls in np.unique(segments.labels):
-            mask = segments.labels == cls
-            if mask.sum() == 0:
-                continue
-            corr = _abs_pearson(base_z[mask].ravel(), reissued_z[mask].ravel())
-            if not np.isnan(corr):
-                key_corrs.append(corr)
-        diversity_per_key.append(np.asarray(key_corrs, dtype=np.float64))
+        diversity_per_key.append(
+            _per_class_abs_corr(base_z, reissued_z, segments.labels)
+        )
 
     if not renew_per_key:
         raise ValueError("n_keys must be ≥ 2 to evaluate cancelability.")
