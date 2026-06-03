@@ -3,20 +3,27 @@
 Runs the core protocol of the signal-domain sibling project, adapted to the
 feature-domain BioHashing transform:
 
-    identification CV · verification CV · cancelability · key sensitivity ·
-    inversion / leakage · DET curves.
+    identification CV · verification CV · cancelability · non-invertibility ·
+    stolen-token worst case · cross-activity · DET curves.
+
+Runs over one or more cohorts (MIMIC-100, BIDMC, PTT-PPG). Each dataset's
+outputs land in `results/<Name>_<date>_<hour>/`; a cross-dataset headline
+comparison lands in `results/shared/`.
 
 Examples
 --------
-  # Identification + verification over the default regimes, clean signals:
+  # Identification + verification over every dataset, clean signals:
   python scripts/run_experiment.py -v
 
-  # Quick smoke test (8 subjects, 3 folds, one feature level):
-  python scripts/run_experiment.py --max-subjects 8 --cv-folds 3 \
-                                   --feature-levels 4 -v
-
-  # Everything (cancelability, key sensitivity, inversion, DET plots):
+  # Everything, every dataset (the full Q1 battery + cross-activity + figures):
   python scripts/run_experiment.py --all -v
+
+  # Restrict to one dataset:
+  python scripts/run_experiment.py --datasets bidmc --all -v
+
+  # Quick smoke test (8 subjects, 3 folds, one feature level, MIMIC only):
+  python scripts/run_experiment.py --datasets mimic --max-subjects 8 \
+                                   --cv-folds 3 --feature-levels 4 -v
 """
 
 from __future__ import annotations
@@ -28,11 +35,12 @@ import logging
 import os
 import subprocess
 import sys
-from dataclasses import asdict
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from itertools import chain
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -43,40 +51,32 @@ if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
 
 from mwf import (  # noqa: E402
-    DEFAULT_RATIOS,
     BiometricSegments,
     DEFAULT_PROJECTION_RATIO,
     DEFAULT_SPLIT_SEEDS,
     FEATURE_WAVELET,
     KeyMode,
     METRIC_NAMES,
-    benchmark,
     build_templates,
     class_score_matrix,
     closed_set_score_pools,
     compare_classifiers,
+    cross_session_verification,
     cross_validate_tasks,
+    CrossValidationResult,
     CVTask,
     decidability,
     det_curve_from_scores,
     evaluate,
     evaluate_cancelability,
-    extract_features,
-    extract_features_batch,
-    feature_dimension,
-    key_sensitivity,
+    load_bidmc,
     load_mimic100,
+    load_ptt_ppg,
     make_pipeline,
     max_feature_level,
-    multimodal_leakage_metrics,
     nadeau_bengio_ci_mean,
     non_invertibility_analysis,
-    per_subject_ablation,
     rank_k_accuracies,
-    ratio_sweep,
-    record_multiplicity_leakage,
-    INDEPENDENT,
-    SHARED_SUBSPACE,
     run_verification_cv,
     set_global_seeds,
     stolen_token_score_pools,
@@ -84,6 +84,7 @@ from mwf import (  # noqa: E402
     subject_holdout,
     summarise_run,
     temporal_holdout_per_subject,
+    VerificationMode,
 )
 from mwf.batch_utils import parallel_map  # noqa: E402
 from mwf.classifiers import (  # noqa: E402
@@ -91,20 +92,11 @@ from mwf.classifiers import (  # noqa: E402
     build_classifier,
     build_param_grid,
 )
-from mwf.feature_transform import (  # noqa: E402
-    transform_multimodal,
-    transform_multimodal_batch,
-)
 from mwf.plots import (  # noqa: E402
     plot_classifier_comparison,
     plot_det_curves,
-    plot_inversion_leakage,
-    plot_key_sensitivity,
     plot_non_invertibility,
-    plot_per_subject_ablation,
     plot_pr_curves,
-    plot_ratio_sweep,
-    plot_record_multiplicity,
     plot_regime_summary,
     plot_roc_curves,
     plot_score_distribution,
@@ -119,6 +111,43 @@ DEFAULT_REGIMES: tuple[KeyMode, ...] = (
     KeyMode.PER_SUBJECT,
 )
 RANK_TARGETS: tuple[int, ...] = (1, 5, 10, 20)
+VERIFICATION_MODES: tuple[VerificationMode, ...] = ("closed_set", "open_set")
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetSpec:
+    """One evaluable cohort: how to load it and its cross-activity structure.
+
+    Attributes:
+        key: CLI selector for ``--datasets``.
+        name: Output-folder / report display name.
+        load: Zero-arg loader returning the cohort's ``BiometricSegments`` (the
+            enrolment condition for multi-activity datasets).
+        enrol_activity: Enrolment condition name for multi-activity datasets;
+            ``None`` for single-recording cohorts (no cross-activity protocol).
+        probe_activities: Probe conditions verified against ``enrol_activity``.
+        load_activity: Loader for one named activity (cross-activity only).
+    """
+
+    key: str
+    name: str
+    load: Callable[[], BiometricSegments]
+    enrol_activity: str | None = None
+    probe_activities: tuple[str, ...] = ()
+    load_activity: Callable[[str], BiometricSegments] | None = None
+
+
+# MIMIC-100 and BIDMC are single-recording cohorts at 125 Hz; PTT-PPG records
+# sit/walk/run separately at 500 Hz, enabling the cross-activity protocol.
+DATASET_SPECS: dict[str, DatasetSpec] = {
+    "mimic": DatasetSpec("mimic", "MIMIC-100", load_mimic100),
+    "bidmc": DatasetSpec("bidmc", "BIDMC", load_bidmc),
+    "ptt": DatasetSpec(
+        "ptt", "PTT-PPG", load=lambda: load_ptt_ppg("sit"),
+        enrol_activity="sit", probe_activities=("walk", "run"),
+        load_activity=load_ptt_ppg,
+    ),
+}
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -295,7 +324,7 @@ def _identification_and_verification(
     run_identification: bool,
     run_verification: bool,
     tune: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict[str, object]]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict[str, CrossValidationResult]]]:
     """Sweep regimes × feature levels for identification and verification CV.
 
     Args:
@@ -317,7 +346,7 @@ def _identification_and_verification(
     """
     id_rows: list[dict] = []
     ver_rows: list[dict] = []
-    id_results: dict[str, dict[str, object]] = {}
+    id_results: dict[str, dict[str, CrossValidationResult]] = {}
 
     # Build the templates for each (regime, level) once; reused by both protocols
     # (and shared read-only across the worker pool via joblib's memmap).
@@ -348,7 +377,7 @@ def _identification_and_verification(
             tasks, n_folds=n_folds, split_seeds=split_seeds, ranks=RANK_TARGETS,
         )
         for task, result in zip(tasks, results):
-            regime, level, name = task.key
+            regime, level, name = cast(tuple[KeyMode, int, str], task.key)
             id_results.setdefault(f"{regime.value}@L{level}", {})[name] = result
             id_rows.append(
                 _identification_metric_row(regime.value, level, name, result, tuned=tune)
@@ -362,7 +391,7 @@ def _identification_and_verification(
             (regime, level, mode)
             for regime in regimes
             for level in feature_levels
-            for mode in ("closed_set", "open_set")
+            for mode in VERIFICATION_MODES
         ]
         ver_items = [(bundles[(regime, level)], mode) for regime, level, mode in ver_keys]
         vers = parallel_map(
@@ -395,107 +424,6 @@ def _cancelability_df(
         )
         rows.append({"feature_level": level, **asdict(report)})
     return pd.DataFrame(rows)
-
-
-def _key_sensitivity_df(
-    segments: BiometricSegments,
-    *,
-    feature_level: int,
-    projection_ratio: float,
-    binarise: bool,
-    n_segments: int,
-    n_trials: int,
-    seed: int,
-) -> pd.DataFrame:
-    """Bit-flip key sensitivity of the template on a random segment sample."""
-    rng = np.random.default_rng(seed + 7)
-    idx = rng.choice(
-        segments.num_segments, size=min(n_segments, segments.num_segments), replace=False,
-    )
-
-    # Each segment is an independent, RNG-self-contained probe (its base token is
-    # derived from the fixed index ``i``), so the per-segment work fans out across
-    # cores with order-preserving results identical to the sequential loop.
-    def _row(i: int) -> dict:
-        x = extract_features(segments.ecg[i], segments.ppg[i], level=feature_level)
-        report = key_sensitivity(
-            transform_fn=lambda tok: transform_multimodal(
-                x, tok, projection_ratio=projection_ratio, binarise=binarise,
-            ),
-            base_password=f"KEY_SENS_{i}",
-            n_trials=n_trials,
-        )
-        return {"segment": int(i), **asdict(report)}
-
-    return pd.DataFrame(parallel_map([int(i) for i in idx], _row))
-
-
-def _inversion_df(
-    segments: BiometricSegments,
-    *,
-    feature_level: int,
-    projection_ratio: float,
-    n_segments: int,
-    seed: int,
-) -> pd.DataFrame:
-    """Leakage of the hybrid transform: linear ECG inverse vs IoM PPG best-effort."""
-    rng = np.random.default_rng(seed + 11)
-    idx = rng.choice(
-        segments.num_segments, size=min(n_segments, segments.num_segments), replace=False,
-    )
-    half = feature_dimension(feature_level) // 2
-
-    # Per-segment leakage is independent and deterministic in the index ``i``;
-    # fan out across cores (order preserved, results bit-identical).
-    def _row(i: int) -> dict:
-        x = extract_features(segments.ecg[i], segments.ppg[i], level=feature_level)
-        token = f"USER_INV_{i}"
-        report = multimodal_leakage_metrics(
-            x[:half], x[half:], token, projection_ratio=projection_ratio,
-        )
-        return {"segment": int(i), "feature_level": feature_level, **asdict(report)}
-
-    return pd.DataFrame(parallel_map([int(i) for i in idx], _row))
-
-
-def _record_multiplicity_df(
-    segments: BiometricSegments,
-    *,
-    feature_level: int,
-    projection_ratio: float,
-    n_segments: int,
-    n_templates: int,
-    seed: int,
-) -> pd.DataFrame:
-    """ARM recovery of the ECG block per probed segment, for both revocation policies.
-
-    Contrasts the operational ``independent``-token revocation (vulnerable) against
-    the hardened ``shared_subspace`` rotation, so the figure shows the leakage
-    climbing to 1 for the former and staying flat for the latter.
-    """
-    rng = np.random.default_rng(seed + 13)
-    idx = rng.choice(
-        segments.num_segments, size=min(n_segments, segments.num_segments), replace=False,
-    )
-    half = feature_dimension(feature_level) // 2
-
-    # Per-segment ARM recovery is independent and deterministic in ``i``; fan out
-    # across cores. Each worker returns its (segment × revocation × k) rows and
-    # the order-preserving map keeps the overall row order identical.
-    def _rows(i: int) -> list[dict]:
-        x = extract_features(segments.ecg[i], segments.ppg[i], level=feature_level)
-        token = f"USER_ARM_{i}"
-        out: list[dict] = []
-        for revocation in (INDEPENDENT, SHARED_SUBSPACE):
-            for report in record_multiplicity_leakage(
-                x[:half], token, n_templates,
-                projection_ratio=projection_ratio, revocation=revocation,
-            ):
-                out.append({"segment": int(i), "feature_level": feature_level, **asdict(report)})
-        return out
-
-    nested = parallel_map([int(i) for i in idx], _rows)
-    return pd.DataFrame(list(chain.from_iterable(nested)))
 
 
 def _non_invertibility_outputs(
@@ -541,54 +469,6 @@ def _non_invertibility_outputs(
     return report_df, pools_df, pools
 
 
-def _per_subject_ablation_df(
-    segments: BiometricSegments,
-    *,
-    feature_level: int,
-    projection_ratio: float,
-    binarise: bool,
-    seed: int,
-    group_sizes: tuple[int, ...] | None = None,
-) -> pd.DataFrame:
-    """Key-vs-biometric ablation: EER as group size (subjects per token) grows."""
-    points = per_subject_ablation(
-        segments,
-        feature_level=feature_level,
-        projection_ratio=projection_ratio,
-        binarise=binarise,
-        group_sizes=group_sizes,
-        seed=seed,
-    )
-    return pd.DataFrame([
-        {"feature_level": feature_level, **asdict(p)} for p in points
-    ])
-
-
-def _ratio_sweep_df(
-    segments: BiometricSegments,
-    *,
-    feature_level: int,
-    binarise: bool,
-    ratios: tuple[float, ...],
-    seed: int,
-    max_victims: int | None = 40,
-    n_inversion_segments: int = 16,
-) -> pd.DataFrame:
-    """Recognition-leakage trade-off across ``ratios`` at one feature level."""
-    points = ratio_sweep(
-        segments,
-        feature_level=feature_level,
-        ratios=ratios,
-        binarise=binarise,
-        max_victims=max_victims,
-        n_inversion_segments=n_inversion_segments,
-        seed=seed,
-    )
-    return pd.DataFrame([
-        {"feature_level": feature_level, **asdict(p)} for p in points
-    ])
-
-
 def _stolen_token_df(
     segments: BiometricSegments,
     *,
@@ -619,45 +499,6 @@ def _stolen_token_df(
                 "impostor_mean": r.impostor_mean,
             })
     return pd.DataFrame(rows)
-
-
-def _timing_df(
-    segments: BiometricSegments,
-    *,
-    feature_level: int,
-    projection_ratio: float,
-    binarise: bool,
-    n_repeats: int = 5,
-) -> pd.DataFrame:
-    """Benchmark the extraction and BioHashing-projection stages."""
-    sample_n = min(8, segments.num_segments)
-    ecg, ppg = segments.ecg[:sample_n], segments.ppg[:sample_n]
-    extract_bench = benchmark(
-        "extract_features_batch",
-        lambda: extract_features_batch(ecg, ppg, level=feature_level),
-        repeats=n_repeats, inner_loops=sample_n,
-    )
-    feats = extract_features_batch(ecg, ppg, level=feature_level)
-    tokens = [f"BENCH_{k}" for k in range(sample_n)]
-    project_bench = benchmark(
-        "transform_multimodal_batch",
-        lambda: transform_multimodal_batch(
-            feats, tokens, projection_ratio=projection_ratio, binarise=binarise,
-        ),
-        repeats=n_repeats, inner_loops=sample_n,
-    )
-    return pd.DataFrame([
-        {
-            "stage": r.label,
-            "per_call_ms": r.per_call_ms(),
-            "mean_s": r.mean_s,
-            "std_s": r.std_s,
-            "ci_low_s": r.ci_low,
-            "ci_high_s": r.ci_high,
-            "bytes_output": r.bytes_output,
-        }
-        for r in (extract_bench, project_bench)
-    ])
 
 
 def _holdout_df(
@@ -694,7 +535,7 @@ def _holdout_df(
                 pipe.fit(train_b.features, train_b.labels)
                 y_score = class_score_matrix(pipe, test_b.features)
                 classes = np.asarray(pipe.named_steps["clf"].classes_, dtype=np.int64)
-                y_pred = pipe.predict(test_b.features)
+                y_pred = np.asarray(pipe.predict(test_b.features), dtype=np.int64)
                 metrics = evaluate(test_b.labels, y_pred, y_score, classes)
                 ranks = rank_k_accuracies(test_b.labels, y_score, classes)
                 rows.append({
@@ -777,8 +618,47 @@ def _subject_holdout_df(
     return pd.DataFrame(rows)
 
 
+def _cross_activity_df(
+    spec: DatasetSpec,
+    enrol_segments: BiometricSegments,
+    *,
+    max_subjects: int | None,
+    projection_ratio: float,
+    binarise: bool,
+    seed: int,
+) -> pd.DataFrame:
+    """Verify each activity's probes against the enrol-activity centroid.
+
+    One row per probe activity plus a within-condition reference; empty for
+    single-recording cohorts. Sibling activities are loaded on demand.
+    """
+    if spec.enrol_activity is None or spec.load_activity is None:
+        return pd.DataFrame()
+    rows = []
+    for activity in (spec.enrol_activity, *spec.probe_activities):
+        within = activity == spec.enrol_activity
+        probe_segments = (
+            enrol_segments if within
+            else _subset_segments(spec.load_activity(activity), max_subjects)
+        )
+        r = cross_session_verification(
+            enrol_segments, probe_segments,
+            enrol_label=spec.enrol_activity, probe_label=activity,
+            projection_ratio=projection_ratio, binarise=binarise,
+            score_norm="znorm", seed=seed,
+        )
+        rows.append({
+            "enrol": r.enrol_label, "probe": r.probe_label, "within_condition": within,
+            "n_subjects": r.n_subjects, "n_genuine": r.n_genuine, "n_impostor": r.n_impostor,
+            "eer": r.eer, "eer_ci_lo": r.eer_ci_low, "eer_ci_hi": r.eer_ci_high,
+            "decidability": r.decidability,
+            "genuine_mean": r.genuine_mean, "impostor_mean": r.impostor_mean,
+        })
+    return pd.DataFrame(rows)
+
+
 def _significance_df(
-    id_results: dict[str, dict[str, object]], *, n_folds: int,
+    id_results: dict[str, dict[str, CrossValidationResult]], *, n_folds: int,
 ) -> pd.DataFrame:
     """Pairwise classifier significance with Benjamini-Hochberg FDR correction.
 
@@ -800,13 +680,8 @@ def _plot_figures(
     binarise: bool,
     n_folds: int,
     fig_dir: Path,
-    inversion_df: pd.DataFrame | None = None,
-    key_sensitivity_df: pd.DataFrame | None = None,
-    record_multiplicity_df: pd.DataFrame | None = None,
     non_invertibility_pools: dict[str, np.ndarray] | None = None,
     non_invertibility_report: dict | None = None,
-    per_subject_ablation_df: pd.DataFrame | None = None,
-    ratio_sweep_df: pd.DataFrame | None = None,
     plot_stolen_token: bool = False,
     seed: int = 42,
 ) -> None:
@@ -816,8 +691,8 @@ def _plot_figures(
     ``feature_level``) and reused across the DET/ROC/PR overlays and the
     per-regime score KDEs. The EER/AUC and classifier-comparison summaries are
     read from the identification-metrics frame ``id_df``. The cancelability
-    figures (IoM inversion leakage, key sensitivity, stolen-token scores) are
-    rendered when their source data is available.
+    figures (non-invertibility, stolen-token scores) are rendered when their
+    source data is available.
 
     Args:
         segments: Source cohort for the verification score pools.
@@ -828,10 +703,9 @@ def _plot_figures(
         binarise: Whether to sign-binarise the ECG block.
         n_folds: CV folds for the closed-set score pools.
         fig_dir: Output directory for the PNGs.
-        inversion_df: Per-segment inversion frame for the leakage figure.
-        key_sensitivity_df: Per-segment key-sensitivity frame for that figure.
-        record_multiplicity_df: Per-(segment, n_templates) ARM frame for the
-            record-multiplicity figure.
+        non_invertibility_pools: Wu-style correlation pools for that figure.
+        non_invertibility_report: Single-row non-invertibility report (for SAR
+            annotations on the figure).
         plot_stolen_token: If ``True``, compute the stolen-token pools and plot
             their genuine/impostor distributions (the worst-case figure).
         seed: Seed forwarded to the stolen-token pooling.
@@ -862,12 +736,6 @@ def _plot_figures(
             )
 
     # --- cancelability story (IoM-specific) ---
-    if inversion_df is not None and not inversion_df.empty:
-        plot_inversion_leakage(inversion_df, fig_dir / "inversion_leakage.png")
-    if key_sensitivity_df is not None and not key_sensitivity_df.empty:
-        plot_key_sensitivity(key_sensitivity_df, fig_dir / "key_sensitivity.png")
-    if record_multiplicity_df is not None and not record_multiplicity_df.empty:
-        plot_record_multiplicity(record_multiplicity_df, fig_dir / "record_multiplicity.png")
     if non_invertibility_pools:
         sar_i = (
             float(non_invertibility_report["sar_type1"])
@@ -881,12 +749,6 @@ def _plot_figures(
             non_invertibility_pools, fig_dir / "non_invertibility.png",
             sar_type1=sar_i, sar_type2=sar_ii,
         )
-    if per_subject_ablation_df is not None and not per_subject_ablation_df.empty:
-        plot_per_subject_ablation(
-            per_subject_ablation_df, fig_dir / "per_subject_ablation.png",
-        )
-    if ratio_sweep_df is not None and not ratio_sweep_df.empty:
-        plot_ratio_sweep(ratio_sweep_df, fig_dir / "ratio_sweep.png")
     if plot_stolen_token:
         # Cap victims so the illustrative figure stays fast on large cohorts.
         genuine, impostor = stolen_token_score_pools(
@@ -908,6 +770,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--output-dir", type=Path, default=_PKG_ROOT / "results")
+    parser.add_argument(
+        "--datasets", type=str, nargs="+", default=["all"],
+        choices=[*DATASET_SPECS, "all"],
+        help="Datasets to evaluate (default: all). E.g. `--datasets bidmc ptt`. "
+             "Each writes to `<output-dir>/<Name>_<date>_<hour>/`.",
+    )
     parser.add_argument(
         "--feature-levels", type=int, nargs="+", default=None,
         help="DWT depths to sweep. Default: 1 .. the deepest level usable for "
@@ -933,26 +801,15 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--cancelability-keys", type=int, default=0,
                         help="K random keys for the Gomez-Barrero protocol (≥ 2 to enable).")
-    parser.add_argument("--key-sensitivity", action="store_true")
-    parser.add_argument("--inversion", action="store_true")
-    parser.add_argument("--record-multiplicity", action="store_true",
-                        help="ARM: recover the ECG block from N revoked templates.")
-    parser.add_argument("--arm-templates", type=int, default=4,
-                        help="Max revoked templates the ARM adversary stacks.")
     parser.add_argument("--non-invertibility", action="store_true",
                         help="Wu-style 3-distribution + SAR non-invertibility report.")
     parser.add_argument("--non-invertibility-victims", type=int, default=50,
                         help="Max subjects exercised as Wu-style reconstruction targets.")
-    parser.add_argument("--per-subject-ablation", action="store_true",
-                        help="Sweep how many subjects share a token (key vs biometric).")
-    parser.add_argument("--ratio-sweep", action="store_true",
-                        help="Sweep BioHashing ratio m/d (recognition vs leakage).")
-    parser.add_argument("--ratios", type=float, nargs="+", default=list(DEFAULT_RATIOS),
-                        help="Ratios m/d to sweep when --ratio-sweep is enabled.")
     parser.add_argument("--stolen-token", action="store_true",
                         help="Worst-case (stolen-key) EER — the honest biometric figure of merit.")
-    parser.add_argument("--timing", action="store_true",
-                        help="Per-stage computational-cost benchmark with bootstrap CI.")
+    parser.add_argument("--cross-activity", action="store_true",
+                        help="Cross-activity verification for multi-activity datasets "
+                             "(PTT-PPG: enrol sit, probe walk/run) — cross-condition robustness.")
     parser.add_argument("--holdout", action="store_true",
                         help="Within-subject temporal-holdout (fit on train, score the tail; "
                              "scaler fitted on train only).")
@@ -971,14 +828,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args(argv)
     if args.all:
-        args.key_sensitivity = True
-        args.inversion = True
-        args.record_multiplicity = True
         args.non_invertibility = True
-        args.per_subject_ablation = True
-        args.ratio_sweep = True
         args.stolen_token = True
-        args.timing = True
+        args.cross_activity = True
         args.holdout = True
         args.subject_holdout = True
         args.significance = True
@@ -988,35 +840,51 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     return args
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Run the configured experiment blocks and persist their outputs."""
-    args = _parse_args(argv)
-    _configure_logging(args.verbose)
-    set_global_seeds(args.seed)
+def run_dataset(
+    spec: DatasetSpec,
+    segments: BiometricSegments,
+    *,
+    args: argparse.Namespace,
+    regimes: tuple[KeyMode, ...],
+    out_dir: Path,
+) -> dict[str, object]:
+    """Run the configured analysis blocks for one cohort, writing to ``out_dir``.
 
-    segments = _subset_segments(load_mimic100(), args.max_subjects)
-    regimes = tuple(KeyMode(r) for r in args.regimes)
+    Feature levels are derived from this cohort's own segment length, so no config
+    bleeds across datasets.
+
+    Args:
+        spec: The cohort being evaluated.
+        segments: Its loaded ECG/PPG segments.
+        args: Parsed CLI options.
+        regimes: Key regimes to sweep.
+        out_dir: Per-dataset output directory.
+
+    Returns:
+        A one-row headline summary for the cross-dataset comparison table.
+    """
     if args.feature_levels:
         feature_levels = tuple(args.feature_levels)
     else:
-        # Sweep every usable DWT depth: 1 .. max for the feature wavelet at this
-        # segment length (e.g. 1..6 for bior3.3 on MIMIC-100's 750-sample segments).
         max_level = max_feature_level(segments.segment_length, FEATURE_WAVELET)
         feature_levels = tuple(range(1, max_level + 1))
-    # Single-level analyses (key sensitivity, inversion, timing, holdout, DET)
-    # report on the deepest level — the richest template and the most demanding
-    # case for the security/cost figures.
     representative_level = max(feature_levels)
     logger.info(
-        "Feature levels: %s (representative single-level=%d).",
-        feature_levels, representative_level,
+        "[%s] %d subjects · %d segments · %d-sample @ %d Hz · feature levels %s.",
+        spec.name, segments.num_subjects, segments.num_segments,
+        segments.segment_length, segments.sampling_rate, feature_levels,
     )
-    out = args.output_dir
     _write_manifest(
-        out, args,
-        n_segments=segments.num_segments,
-        n_subjects=segments.num_subjects,
+        out_dir, args, n_segments=segments.num_segments, n_subjects=segments.num_subjects,
     )
+
+    summary: dict[str, object] = {
+        "dataset": spec.name,
+        "n_subjects": segments.num_subjects,
+        "n_segments": segments.num_segments,
+        "segment_length": segments.segment_length,
+        "sampling_rate": segments.sampling_rate,
+    }
 
     id_df, ver_df, id_results = _identification_and_verification(
         segments,
@@ -1030,13 +898,23 @@ def main(argv: list[str] | None = None) -> None:
         run_verification=args.protocol in ("verification", "both"),
         tune=args.tune,
     )
-    _save_csv(id_df, out / "metrics.csv")
-    _save_csv(ver_df, out / "verification.csv")
+    _save_csv(id_df, out_dir / "metrics.csv")
+    _save_csv(ver_df, out_dir / "verification.csv")
+    if not id_df.empty:
+        best = id_df.loc[id_df["eer_mean"].idxmin()]
+        summary["identification_eer"] = float(id_df["eer_mean"].min())
+        summary["identification_auc"] = float(id_df["auc_mean"].max())
+        summary["best_regime"] = str(best["regime"])
+        summary["best_classifier"] = str(best["classifier"])
+    if not ver_df.empty:
+        closed = ver_df[ver_df["verification_mode"] == "closed_set"]
+        if not closed.empty:
+            summary["verification_eer"] = float(closed["eer_mean"].min())
 
     if args.significance and id_results:
         _save_csv(
             _significance_df(id_results, n_folds=args.cv_folds),
-            out / "significance.csv",
+            out_dir / "significance.csv",
         )
 
     if args.cancelability_keys >= 2:
@@ -1046,31 +924,8 @@ def main(argv: list[str] | None = None) -> None:
                 projection_ratio=args.projection_ratio, binarise=args.binarise,
                 n_keys=args.cancelability_keys, seed=args.seed,
             ),
-            out / "cancelability.csv",
+            out_dir / "cancelability.csv",
         )
-    ks_df: pd.DataFrame | None = None
-    if args.key_sensitivity:
-        ks_df = _key_sensitivity_df(
-            segments, feature_level=representative_level,
-            projection_ratio=args.projection_ratio, binarise=args.binarise,
-            n_segments=16, n_trials=24, seed=args.seed,
-        )
-        _save_csv(ks_df, out / "key_sensitivity.csv")
-    inv_df: pd.DataFrame | None = None
-    if args.inversion:
-        inv_df = _inversion_df(
-            segments, feature_level=representative_level,
-            projection_ratio=args.projection_ratio, n_segments=16, seed=args.seed,
-        )
-        _save_csv(inv_df, out / "inversion.csv")
-    arm_df: pd.DataFrame | None = None
-    if args.record_multiplicity:
-        arm_df = _record_multiplicity_df(
-            segments, feature_level=representative_level,
-            projection_ratio=args.projection_ratio, n_segments=16,
-            n_templates=args.arm_templates, seed=args.seed,
-        )
-        _save_csv(arm_df, out / "arm.csv")
     ni_pools: dict[str, np.ndarray] | None = None
     ni_report: dict | None = None
     if args.non_invertibility:
@@ -1079,42 +934,30 @@ def main(argv: list[str] | None = None) -> None:
             projection_ratio=args.projection_ratio, binarise=args.binarise,
             max_victims=args.non_invertibility_victims, seed=args.seed,
         )
-        _save_csv(ni_report_df, out / "non_invertibility.csv")
-        _save_csv(ni_pools_df, out / "non_invertibility_pools.csv")
+        _save_csv(ni_report_df, out_dir / "non_invertibility.csv")
+        _save_csv(ni_pools_df, out_dir / "non_invertibility_pools.csv")
         if not ni_report_df.empty:
             ni_report = ni_report_df.iloc[0].to_dict()
-    psa_df: pd.DataFrame | None = None
-    if args.per_subject_ablation:
-        psa_df = _per_subject_ablation_df(
-            segments, feature_level=representative_level,
-            projection_ratio=args.projection_ratio, binarise=args.binarise,
-            seed=args.seed,
-        )
-        _save_csv(psa_df, out / "per_subject_ablation.csv")
-    rs_df: pd.DataFrame | None = None
-    if args.ratio_sweep:
-        rs_df = _ratio_sweep_df(
-            segments, feature_level=representative_level,
-            binarise=args.binarise, ratios=tuple(args.ratios), seed=args.seed,
-        )
-        _save_csv(rs_df, out / "ratio_sweep.csv")
+            summary["non_invertibility_leakage_gap"] = float(ni_report["leakage_gap"])
+            summary["non_invertibility_sar1"] = float(ni_report["sar_type1"])
     if args.stolen_token:
-        _save_csv(
-            _stolen_token_df(
-                segments, feature_levels=feature_levels,
-                projection_ratio=args.projection_ratio, binarise=args.binarise,
-                seed=args.seed,
-            ),
-            out / "stolen_token.csv",
+        st_df = _stolen_token_df(
+            segments, feature_levels=feature_levels,
+            projection_ratio=args.projection_ratio, binarise=args.binarise, seed=args.seed,
         )
-    if args.timing:
-        _save_csv(
-            _timing_df(
-                segments, feature_level=representative_level,
-                projection_ratio=args.projection_ratio, binarise=args.binarise,
-            ),
-            out / "timing.csv",
+        _save_csv(st_df, out_dir / "stolen_token.csv")
+        raw = st_df[st_df["score_norm"] == "raw"]
+        if not raw.empty:
+            summary["stolen_token_eer"] = float(raw["eer"].min())
+    if spec.enrol_activity is not None and args.cross_activity:
+        ca_df = _cross_activity_df(
+            spec, segments, max_subjects=args.max_subjects,
+            projection_ratio=args.projection_ratio, binarise=args.binarise, seed=args.seed,
         )
+        _save_csv(ca_df, out_dir / "cross_activity.csv")
+        cross = ca_df[~ca_df["within_condition"]] if not ca_df.empty else ca_df
+        if not cross.empty:
+            summary["cross_activity_mean_eer"] = float(cross["eer"].mean())
     if args.holdout:
         _save_csv(
             _holdout_df(
@@ -1122,7 +965,7 @@ def main(argv: list[str] | None = None) -> None:
                 projection_ratio=args.projection_ratio, binarise=args.binarise,
                 test_fraction=args.holdout_fraction,
             ),
-            out / "holdout.csv",
+            out_dir / "holdout.csv",
         )
     if args.subject_holdout:
         _save_csv(
@@ -1132,22 +975,59 @@ def main(argv: list[str] | None = None) -> None:
                 test_fraction=args.holdout_fraction, n_folds=args.cv_folds,
                 seed=args.seed,
             ),
-            out / "subject_holdout.csv",
+            out_dir / "subject_holdout.csv",
         )
     if args.det_plots:
         _plot_figures(
             segments, id_df, regimes=regimes, feature_level=representative_level,
             projection_ratio=args.projection_ratio, binarise=args.binarise,
-            n_folds=args.cv_folds, fig_dir=out / "figures",
-            inversion_df=inv_df, key_sensitivity_df=ks_df,
-            record_multiplicity_df=arm_df,
+            n_folds=args.cv_folds, fig_dir=out_dir / "figures",
             non_invertibility_pools=ni_pools,
             non_invertibility_report=ni_report,
-            per_subject_ablation_df=psa_df,
-            ratio_sweep_df=rs_df,
             plot_stolen_token=args.stolen_token, seed=args.seed,
         )
-    logger.info("Done. Outputs under %s", out)
+    logger.info("[%s] Done. Outputs under %s", spec.name, out_dir)
+    return summary
+
+
+def _resolve_datasets(selected: list[str]) -> list[DatasetSpec]:
+    """Map the ``--datasets`` selection (``all`` or explicit keys) to ordered specs."""
+    keys = list(DATASET_SPECS) if "all" in selected else list(dict.fromkeys(selected))
+    return [DATASET_SPECS[k] for k in keys]
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run the configured analyses across every selected dataset.
+
+    Each dataset writes to ``<output-dir>/<Name>_<date>_<hour>/`` (all sharing one
+    run tag); the cross-dataset comparison goes to ``<output-dir>/shared/``.
+    """
+    args = _parse_args(argv)
+    _configure_logging(args.verbose)
+    set_global_seeds(args.seed)
+
+    regimes = tuple(KeyMode(r) for r in args.regimes)
+    specs = _resolve_datasets(args.datasets)
+    run_tag = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    logger.info(
+        "Evaluating %d dataset(s): %s (run tag %s).",
+        len(specs), ", ".join(s.name for s in specs), run_tag,
+    )
+
+    summaries: list[dict[str, object]] = []
+    for spec in specs:
+        segments = _subset_segments(spec.load(), args.max_subjects)
+        out_dir = args.output_dir / f"{spec.name}_{run_tag}"
+        summaries.append(
+            run_dataset(spec, segments, args=args, regimes=regimes, out_dir=out_dir)
+        )
+
+    # Shared cross-dataset headline comparison (one row per dataset).
+    _save_csv(
+        pd.DataFrame(summaries),
+        args.output_dir / "shared" / f"dataset_comparison_{run_tag}.csv",
+    )
+    logger.info("Done. Per-dataset folders + shared/ under %s", args.output_dir)
 
 
 if __name__ == "__main__":

@@ -13,8 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from mwf.plots import (
     plot_classifier_comparison,
     plot_det_curves,
-    plot_inversion_leakage,
-    plot_key_sensitivity,
     plot_pr_curves,
     plot_regime_summary,
     plot_roc_curves,
@@ -95,37 +93,6 @@ def test_nested_output_dir_is_created(tmp_path):
 
 
 # --- cancelability figures ---------------------------------------------------
-
-
-def _inversion_df():
-    n = 16
-    return pd.DataFrame({
-        "ppg_linear_correlation": RNG.uniform(0.6, 0.8, n),
-        "ppg_correlation": RNG.uniform(0.4, 0.7, n),
-        "ecg_correlation": RNG.uniform(0.6, 0.8, n),
-    })
-
-
-def test_inversion_leakage_renders(tmp_path):
-    out = tmp_path / "inversion_leakage.png"
-    plot_inversion_leakage(_inversion_df(), out)
-    assert _nonempty(out)
-
-
-def test_inversion_leakage_skips_empty(tmp_path):
-    out = tmp_path / "inv_empty.png"
-    plot_inversion_leakage(pd.DataFrame(), out)
-    assert not out.exists()
-
-
-def test_key_sensitivity_renders(tmp_path):
-    ks = pd.DataFrame({
-        "bit_error_rate_mean": RNG.normal(0.5, 0.02, 16),
-        "correlation_mean": RNG.normal(0.0, 0.05, 16),
-    })
-    out = tmp_path / "key_sensitivity.png"
-    plot_key_sensitivity(ks, out)
-    assert _nonempty(out)
 
 
 def test_stolen_token_scores_renders(tmp_path):

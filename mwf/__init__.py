@@ -18,8 +18,7 @@ Evaluation mirrors the signal-domain sibling project:
     * StratifiedGroupKFold CV with mean ± std + 95 % bootstrap / Nadeau-Bengio CIs,
     * three regimes (identity / single_key / per_subject),
     * cancelability protocol (renewability / diversity / Gomez-Barrero D_↔^sys),
-    * template key-sensitivity (BER + correlation under 1-bit token edits),
-    * inversion / leakage analysis of the random projection,
+    * Wu-style non-invertibility (3-distribution + SAR) and stolen-token worst case,
     * DET / CMC / operating points,
     * deterministic global seeding.
 """
@@ -27,7 +26,6 @@ Evaluation mirrors the signal-domain sibling project:
 from .constants import (
     BOOTSTRAP_CI_LEVEL,
     BOOTSTRAP_RESAMPLES_EVAL,
-    BOOTSTRAP_RESAMPLES_TIMING,
     DEFAULT_BINARISE,
     DEFAULT_ECG_CLEAN_METHOD,
     DEFAULT_N_FOLDS,
@@ -51,16 +49,25 @@ from .cancelability import (
     UnlinkabilityCurve,
     evaluate_cancelability,
 )
+from .cross_session import (
+    CrossSessionResult,
+    cross_session_score_pools,
+    cross_session_verification,
+)
 from .cv_splits import (
     stratified_group_splitter,
     temporal_block_groups,
 )
 from .dataset import (
+    PTT_PPG_ACTIVITIES,
     SAMPLING_RATE_HZ,
     SEGMENT_DURATION_SECONDS,
     SEGMENT_LENGTH_SAMPLES,
     BiometricSegments,
+    load_bidmc,
     load_mimic100,
+    load_ptt_ppg,
+    segments_from_loader,
 )
 from .evaluation import (
     CV_STRATEGIES,
@@ -101,32 +108,11 @@ from .holdout import (
     subject_holdout_multiseed,
     temporal_holdout_per_subject,
 )
-from .inversion import (
-    InversionReport,
-    multimodal_leakage_metrics,
-    recover_ppg_iom,
-)
 from .keystream import keystream_rng
 from .metrics import ClassificationMetrics, evaluate
 from .non_invertibility import (
     NonInvertibilityReport,
     non_invertibility_analysis,
-)
-from .per_subject_ablation import (
-    AblationPoint,
-    per_subject_ablation,
-)
-from .ratio_sweep import (
-    DEFAULT_RATIOS,
-    RatioSweepPoint,
-    ratio_sweep,
-)
-from .record_multiplicity import (
-    INDEPENDENT,
-    SHARED_SUBSPACE,
-    RecordMultiplicityReport,
-    record_multiplicity_leakage,
-    revoked_projections,
 )
 from .noise import add_awgn_batch
 from .operating_curves import (
@@ -169,10 +155,6 @@ from .scoring import (
     l2_normalise,
     znorm,
 )
-from .security import (
-    KeySensitivityReport,
-    key_sensitivity,
-)
 from .stats_helpers import (
     bootstrap_ci_mean,
     nadeau_bengio_ci_mean,
@@ -184,7 +166,6 @@ from .stolen_token import (
     stolen_token_score_pools,
     stolen_token_verification,
 )
-from .timing import TimingResult, benchmark
 from .verification import (
     VerificationFoldResult,
     VerificationMode,
@@ -194,24 +175,24 @@ from .verification import (
 )
 
 __all__ = [
-    "AblationPoint",
     "BOOTSTRAP_CI_LEVEL",
     "BOOTSTRAP_RESAMPLES_EVAL",
-    "BOOTSTRAP_RESAMPLES_TIMING",
     "BiometricSegments",
     "CV_STRATEGIES",
     "CancelabilityReport",
     "ClassificationMetrics",
     "CmcCurve",
     "ComparisonRow",
+    "CrossSessionResult",
     "CrossValidationResult",
+    "cross_session_score_pools",
+    "cross_session_verification",
     "DEFAULT_BINARISE",
     "DEFAULT_ECG_CLEAN_METHOD",
     "DEFAULT_N_FOLDS",
     "DEFAULT_PIPELINE_CONFIG",
     "DEFAULT_PPG_CLEAN_METHOD",
     "DEFAULT_PROJECTION_RATIO",
-    "DEFAULT_RATIOS",
     "DEFAULT_SEED",
     "DEFAULT_SEGMENTS_PER_BLOCK",
     "DEFAULT_SPLIT_SEEDS",
@@ -220,9 +201,7 @@ __all__ = [
     "FEATURE_WAVELET",
     "FoldEvaluation",
     "HoldoutSplit",
-    "InversionReport",
     "KeyMode",
-    "KeySensitivityReport",
     "METRIC_NAMES",
     "MetricSummary",
     "N_MODALITIES",
@@ -231,7 +210,6 @@ __all__ = [
     "PrCurve",
     "FeatureScaler",
     "ProjectionKey",
-    "RatioSweepPoint",
     "RocCurve",
     "SAMPLING_RATE_HZ",
     "SEGMENT_DURATION_SECONDS",
@@ -239,13 +217,11 @@ __all__ = [
     "STATS_PER_BAND",
     "StolenTokenResult",
     "TemplateBundle",
-    "TimingResult",
     "UnlinkabilityCurve",
     "VerificationFoldResult",
     "VerificationMode",
     "VerificationResult",
     "add_awgn_batch",
-    "benchmark",
     "bootstrap_ci_mean",
     "build_templates",
     "clean_ecg",
@@ -276,24 +252,19 @@ __all__ = [
     "iom_dim",
     "iom_indices",
     "iom_onehot",
-    "key_sensitivity",
     "keystream_rng",
     "l2_normalise",
+    "load_bidmc",
     "load_mimic100",
+    "load_ptt_ppg",
+    "segments_from_loader",
+    "PTT_PPG_ACTIVITIES",
     "make_cv_splitter",
     "make_pipeline",
     "make_rng",
     "max_feature_level",
     "multimodal_dims",
-    "multimodal_leakage_metrics",
     "non_invertibility_analysis",
-    "per_subject_ablation",
-    "ratio_sweep",
-    "INDEPENDENT",
-    "SHARED_SUBSPACE",
-    "RecordMultiplicityReport",
-    "record_multiplicity_leakage",
-    "revoked_projections",
     "nadeau_bengio_ci_mean",
     "nadeau_bengio_paired_t",
     "operating_points",
@@ -301,7 +272,6 @@ __all__ = [
     "preprocess_signals",
     "projection_dim",
     "rank_k_accuracies",
-    "recover_ppg_iom",
     "roc_curve_from_scores",
     "run_verification_cv",
     "set_global_seeds",

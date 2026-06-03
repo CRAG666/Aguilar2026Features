@@ -24,11 +24,12 @@ from typing import Final, NamedTuple
 import numpy as np
 from joblib import Parallel, delayed, parallel_config
 from numpy.typing import NDArray
-from sklearn.base import BaseEstimator, ClassifierMixin, clone
+from sklearn.base import BaseEstimator, clone
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from .classifiers import Classifier
 from .clean import clean_ecg_batch, clean_ppg_batch
 from .constants import (
     DEFAULT_BINARISE,
@@ -308,7 +309,7 @@ def build_templates(
 
 
 def class_score_matrix(
-    estimator: ClassifierMixin, x: NDArray[np.float64]
+    estimator: BaseEstimator, x: NDArray[np.float64]
 ) -> NDArray[np.float64]:
     """Return a ``(n, n_classes)`` per-class score matrix as ``float64``.
 
@@ -330,9 +331,11 @@ def class_score_matrix(
     Returns:
         ``(n, n_classes)`` score matrix whose columns align with ``classes_``.
     """
-    if hasattr(estimator, "predict_proba"):
-        return np.asarray(estimator.predict_proba(x), dtype=np.float64)
-    scores = np.asarray(estimator.decision_function(x), dtype=np.float64)
+    proba = getattr(estimator, "predict_proba", None)
+    if proba is not None:
+        return np.asarray(proba(x), dtype=np.float64)
+    decision = getattr(estimator, "decision_function")
+    scores = np.asarray(decision(x), dtype=np.float64)
     if scores.ndim == 1:  # binary one-vs-rest → two class-aligned columns
         scores = np.column_stack([-scores, scores])
     return scores
@@ -346,7 +349,7 @@ DEFAULT_INNER_FOLDS: Final[int] = 3
 DEFAULT_TUNE_SCORING: Final[str] = "f1_macro"
 
 
-def make_pipeline(classifier: ClassifierMixin) -> Pipeline:
+def make_pipeline(classifier: Classifier) -> Pipeline:
     """Wrap ``classifier`` in a ``StandardScaler`` + classifier pipeline.
 
     Args:
@@ -359,13 +362,13 @@ def make_pipeline(classifier: ClassifierMixin) -> Pipeline:
 
 
 def _build_fold_estimator(
-    classifier: ClassifierMixin,
+    classifier: Classifier,
     param_grid: Mapping[str, list] | None,
     groups_train: NDArray[np.int64] | None,
     labels_train: NDArray[np.int64],
     inner_folds: int,
     scoring: str,
-) -> tuple[BaseEstimator, bool]:
+) -> tuple[Pipeline | GridSearchCV, bool]:
     """Build the per-fold estimator, tuning hyperparameters when a grid is given.
 
     Returns:
@@ -470,7 +473,7 @@ def _fit_fold(
     labels: NDArray[np.int64],
     train_idx: NDArray[np.int64],
     test_idx: NDArray[np.int64],
-    classifier: ClassifierMixin,
+    classifier: Classifier,
     param_grid: Mapping[str, list] | None = None,
     groups: NDArray[np.int64] | None = None,
     inner_folds: int = DEFAULT_INNER_FOLDS,
@@ -510,7 +513,7 @@ def _fit_fold(
         estimator.fit(x_train, y_train, groups=groups_train)
     else:
         estimator.fit(x_train, y_train)
-    y_pred = estimator.predict(x_test)
+    y_pred = np.asarray(estimator.predict(x_test), dtype=np.int64)
     y_score = _score_matrix(estimator, x_test)
     # ``.classes_`` is exposed by both Pipeline (via the final step) and
     # GridSearchCV (via the refit best estimator), so it works for either path.
@@ -523,7 +526,7 @@ def _fit_eval_fold_full(
     labels: NDArray[np.int64],
     train_idx: NDArray[np.int64],
     test_idx: NDArray[np.int64],
-    classifier: ClassifierMixin,
+    classifier: Classifier,
     ranks: tuple[int, ...],
     param_grid: Mapping[str, list] | None = None,
     groups: NDArray[np.int64] | None = None,
@@ -565,7 +568,7 @@ class _FoldJob(NamedTuple):
     labels: NDArray[np.int64]
     train_idx: NDArray[np.int64]
     test_idx: NDArray[np.int64]
-    classifier: ClassifierMixin
+    classifier: Classifier
     param_grid: Mapping[str, list] | None
     groups: NDArray[np.int64] | None
 
@@ -612,7 +615,7 @@ def _evaluate_fold_jobs(
 def cross_validate_classifier_multiseed(
     bundle: TemplateBundle,
     classifier_name: str,
-    classifier: ClassifierMixin,
+    classifier: Classifier,
     n_folds: int = DEFAULT_N_FOLDS,
     split_seeds: tuple[int, ...] = DEFAULT_SPLIT_SEEDS,
     segments_per_block: int = DEFAULT_SEGMENTS_PER_BLOCK,
@@ -736,7 +739,7 @@ def _assemble_cv_result(
     )
 
 
-def _single_threaded(estimator: ClassifierMixin) -> ClassifierMixin:
+def _single_threaded(estimator: Classifier) -> Classifier:
     """Clone ``estimator`` forcing ``n_jobs=1`` when it exposes that parameter.
 
     When the outer fold pool already saturates every core, an estimator that
@@ -768,7 +771,7 @@ class CVTask:
     key: Hashable
     bundle: TemplateBundle
     classifier_name: str
-    classifier: ClassifierMixin
+    classifier: Classifier
     param_grid: Mapping[str, list] | None = None
 
 

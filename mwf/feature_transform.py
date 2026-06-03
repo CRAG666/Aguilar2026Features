@@ -181,62 +181,6 @@ def derive_projection(token: str, in_dim: int, out_dim: int) -> ProjectionKey:
     return ProjectionKey(matrix=np.ascontiguousarray(q.T))
 
 
-def derive_rotation(token: str, dim: int) -> NDArray[np.float64]:
-    """Build a token-seeded Haar-orthonormal rotation ``Q ∈ ℝ^{dim×dim}``.
-
-    A SHA-256-seeded Gaussian is QR-factorised and sign-corrected (columns scaled
-    by ``sign(diag(R))``) so ``Q`` is uniformly distributed over the orthogonal
-    group, with ``Q Qᵀ = I``.
-
-    Args:
-        token: Seed token.
-        dim: Rotation size.
-
-    Returns:
-        A ``dim × dim`` orthonormal matrix.
-    """
-    rng = keystream_rng(token)
-    q, r = np.linalg.qr(rng.standard_normal((dim, dim)))
-    signs = np.sign(np.diag(r))
-    signs[signs == 0.0] = 1.0
-    return np.ascontiguousarray(q * signs)
-
-
-def derive_revoked_projection(
-    base_token: str, revoke_token: str, in_dim: int, out_dim: int
-) -> ProjectionKey:
-    """Row-space-preserving revocation: rotate a *fixed* base projection in place.
-
-    Standard revocation re-seeds an **independent** projection, so each re-issue
-    hands an adversary ``m`` fresh linear measurements of the same ``x``; after
-    ``⌈d/m⌉`` revocations the stacked system is full-rank and ``x`` is recovered
-    exactly (the record-multiplicity / ARM hole — see
-    :mod:`mwf.record_multiplicity`). Here the user keeps one **fixed** orthonormal
-    base ``R_base`` (anchored on ``base_token``) and revokes by applying a fresh
-    orthonormal rotation ``Q`` (seeded by ``revoke_token``):
-
-        R' = Q · R_base.
-
-    ``R'`` has orthonormal rows and the **same row space** as ``R_base``, so every
-    revoked template lives in that single ``m``-dimensional subspace: stacking any
-    number of them never exceeds rank ``m`` and the min-norm pre-image is capped at
-    the one-template leak forever. ``Q`` still decorrelates the templates (renewable
-    / unlinkable), so cancelability is preserved while ARM is closed.
-
-    Args:
-        base_token: Stable per-user token anchoring the fixed base ``R_base``.
-        revoke_token: Per-revocation token seeding the rotation ``Q``.
-        in_dim: Input feature dimension ``d``.
-        out_dim: Protected-template length ``m`` (``1 ≤ m ≤ d``).
-
-    Returns:
-        A :class:`ProjectionKey` wrapping ``R' = Q · R_base ∈ ℝ^{m×d}``.
-    """
-    base = derive_projection(base_token, in_dim, out_dim).matrix
-    rotation = derive_rotation(revoke_token, out_dim)
-    return ProjectionKey(matrix=np.ascontiguousarray(rotation @ base))
-
-
 def _apply(matrix: NDArray[np.float64], x: NDArray[np.float64], binarise: bool) -> NDArray[np.float64]:
     """Project ``x`` through ``matrix`` and optionally sign-binarise.
 
@@ -432,8 +376,6 @@ __all__ = [
     "PPG_SALT",
     "ProjectionKey",
     "derive_projection",
-    "derive_revoked_projection",
-    "derive_rotation",
     "multimodal_dims",
     "projection_dim",
     "transform_multimodal",

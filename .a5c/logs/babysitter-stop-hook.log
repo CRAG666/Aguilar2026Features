@@ -1,0 +1,28 @@
+[INFO] 2026-06-02T23:34:15.771Z handleHookRunStop started
+[INFO] 2026-06-02T23:34:15.777Z Hook input received
+[INFO] 2026-06-02T23:34:15.777Z [session=3eddc33c-c91f-4258-babb-c003f245c462] Session ID: 3eddc33c-c91f-4258-babb-c003f245c462
+[INFO] 2026-06-02T23:34:15.778Z [session=3eddc33c-c91f-4258-babb-c003f245c462] Resolved pluginRoot: /home/think-crag/.claude/plugins/cache/a5c-ai/babysitter/4.0.157
+[INFO] 2026-06-02T23:34:15.778Z [session=3eddc33c-c91f-4258-babb-c003f245c462] Resolved stateDir: /home/think-crag/.a5c/state
+[INFO] 2026-06-02T23:34:15.778Z [session=3eddc33c-c91f-4258-babb-c003f245c462] Checking session file at: /home/think-crag/.a5c/state/3eddc33c-c91f-4258-babb-c003f245c462.md
+[INFO] 2026-06-02T23:34:15.791Z [session=3eddc33c-c91f-4258-babb-c003f245c462] No run associated with session — allowing exit
+[INFO] 2026-06-02T23:37:39.641Z handleHookRunStop started
+[INFO] 2026-06-02T23:37:39.648Z Hook input received
+[INFO] 2026-06-02T23:37:39.648Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] Session ID: 0590d24b-d1da-427b-a56f-1d83904e6449
+[INFO] 2026-06-02T23:37:39.648Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] Resolved pluginRoot: /home/think-crag/.claude/plugins/cache/a5c-ai/babysitter/4.0.157
+[INFO] 2026-06-02T23:37:39.648Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] Resolved stateDir: /home/think-crag/.a5c/state
+[INFO] 2026-06-02T23:37:39.648Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] Checking session file at: /home/think-crag/.a5c/state/0590d24b-d1da-427b-a56f-1d83904e6449.md
+[INFO] 2026-06-02T23:37:39.652Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] No run associated with session — allowing exit
+[INFO] 2026-06-03T00:51:49.558Z handleHookRunStop started
+[INFO] 2026-06-03T00:51:49.562Z Hook input received
+[INFO] 2026-06-03T00:51:49.562Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] Session ID: 0590d24b-d1da-427b-a56f-1d83904e6449
+[INFO] 2026-06-03T00:51:49.562Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] Resolved pluginRoot: /home/think-crag/.claude/plugins/cache/a5c-ai/babysitter/4.0.157
+[INFO] 2026-06-03T00:51:49.562Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] Resolved stateDir: /home/think-crag/.a5c/state
+[INFO] 2026-06-03T00:51:49.562Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] Checking session file at: /home/think-crag/.a5c/state/0590d24b-d1da-427b-a56f-1d83904e6449.md
+[INFO] 2026-06-03T00:51:49.563Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] No active loop found for session 0590d24b-d1da-427b-a56f-1d83904e6449 — allowing exit
+[INFO] 2026-06-03T00:55:47.207Z handleHookRunStop started
+[INFO] 2026-06-03T00:55:47.212Z Hook input received
+[INFO] 2026-06-03T00:55:47.212Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] Session ID: 0590d24b-d1da-427b-a56f-1d83904e6449
+[INFO] 2026-06-03T00:55:47.212Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] Resolved pluginRoot: /home/think-crag/.claude/plugins/cache/a5c-ai/babysitter/4.0.157
+[INFO] 2026-06-03T00:55:47.212Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] Resolved stateDir: /home/think-crag/.a5c/state
+[INFO] 2026-06-03T00:55:47.212Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] Checking session file at: /home/think-crag/.a5c/state/0590d24b-d1da-427b-a56f-1d83904e6449.md
+[INFO] 2026-06-03T00:55:47.213Z [session=0590d24b-d1da-427b-a56f-1d83904e6449] No active loop found for session 0590d24b-d1da-427b-a56f-1d83904e6449 — allowing exit

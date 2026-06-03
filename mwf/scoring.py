@@ -1,4 +1,4 @@
-"""Score-level utilities shared by verification, cancelability and security."""
+"""Score-level utilities shared by verification, cancelability and non-invertibility."""
 
 from __future__ import annotations
 

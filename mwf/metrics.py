@@ -160,7 +160,7 @@ def _binarise(
     Returns:
         ``(n_samples, n_classes)`` one-hot matrix.
     """
-    out = label_binarize(y_true, classes=classes)
+    out = np.asarray(label_binarize(y_true, classes=classes), dtype=np.int64)
     return np.hstack([1 - out, out]) if out.shape[1] == 1 else out
 
 

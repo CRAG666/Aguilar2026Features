@@ -6,7 +6,6 @@ from types import MappingProxyType
 from collections.abc import Callable, Mapping
 from typing import Final
 
-from sklearn.base import ClassifierMixin
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
@@ -17,6 +16,13 @@ from .constants import DEFAULT_SEED
 
 CLASSIFIER_NAMES: Final[tuple[str, ...]] = ("MLP", "LR", "SVM", "DT", "RF")
 DEFAULT_RANDOM_STATE: Final[int] = DEFAULT_SEED
+
+# Every reference classifier is both a ``BaseEstimator`` and a ``ClassifierMixin``,
+# so this alias satisfies ``sklearn.clone`` and the pipeline/scoring helpers alike.
+type Classifier = (
+    DecisionTreeClassifier | SVC | LogisticRegression
+    | RandomForestClassifier | MLPClassifier
+)
 
 
 def make_decision_tree() -> DecisionTreeClassifier:
@@ -96,7 +102,7 @@ def make_mlp() -> MLPClassifier:
     )
 
 
-_FACTORIES: Final[Mapping[str, Callable[[], ClassifierMixin]]] = MappingProxyType(
+_FACTORIES: Final[Mapping[str, Callable[[], Classifier]]] = MappingProxyType(
     {
         "MLP": make_mlp,
         "LR": make_logistic_regression,
@@ -107,7 +113,7 @@ _FACTORIES: Final[Mapping[str, Callable[[], ClassifierMixin]]] = MappingProxyTyp
 )
 
 
-def build_classifier(name: str) -> ClassifierMixin:
+def build_classifier(name: str) -> Classifier:
     """Instantiate a fresh classifier by name.
 
     Args:

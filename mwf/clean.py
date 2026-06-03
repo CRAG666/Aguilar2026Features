@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable
-from typing import Final
+from typing import Any, Final
 
 import neurokit2 as nk
 import numpy as np
@@ -49,8 +49,9 @@ def _validate(signal: NDArray[np.float64], sampling_rate: int) -> None:
 
 
 # NeuroKit cleaners share one signature ``(signal, sampling_rate=, method=)`` and
-# one calling convention (suppress their chatty warnings, coerce to float64).
-_NkCleaner = Callable[..., NDArray[np.float64]]
+# one calling convention (suppress their chatty warnings, coerce to float64). Their
+# stubbed return is loose, so ``_clean_one`` coerces the result with ``np.asarray``.
+_NkCleaner = Callable[..., Any]
 
 
 def _clean_one(

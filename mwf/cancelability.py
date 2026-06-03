@@ -6,7 +6,7 @@ import hashlib
 import logging
 import warnings
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Literal, overload
 
 import numpy as np
 from numpy.typing import NDArray
@@ -378,6 +378,30 @@ def _per_class_abs_corr(
     return np.asarray(corrs, dtype=np.float64)
 
 
+@overload
+def evaluate_cancelability(
+    segments: BiometricSegments,
+    feature_level: int = ...,
+    feature_wavelet: str = ...,
+    projection_ratio: float = ...,
+    binarise: bool = ...,
+    n_keys: int = ...,
+    seed: int = ...,
+    return_curve: Literal[False] = ...,
+    config: PipelineConfig | None = ...,
+) -> CancelabilityReport: ...
+@overload
+def evaluate_cancelability(
+    segments: BiometricSegments,
+    feature_level: int = ...,
+    feature_wavelet: str = ...,
+    projection_ratio: float = ...,
+    binarise: bool = ...,
+    n_keys: int = ...,
+    seed: int = ...,
+    return_curve: Literal[True] = ...,
+    config: PipelineConfig | None = ...,
+) -> tuple[CancelabilityReport, UnlinkabilityCurve]: ...
 def evaluate_cancelability(
     segments: BiometricSegments,
     feature_level: int = DEFAULT_FEATURE_LEVEL,

@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import Final
 
 import numpy as np
+from numpy.typing import NDArray
 from sklearn.model_selection import (
     GroupKFold,
     LeaveOneGroupOut,
@@ -131,7 +132,7 @@ class MetricSummary:
 
 
 def summarise(
-    name: str, values: Sequence[float],
+    name: str, values: Sequence[float] | NDArray[np.float64],
     n_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
     ci_level: float = DEFAULT_CI_LEVEL,
     seed: int = DEFAULT_GLOBAL_SEED,

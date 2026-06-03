@@ -43,6 +43,7 @@ dependencies = [
     "polars>=1.41.0",
     "setuptools>=75,<81",
     "typing-extensions>=4.12",
+    "wfdb==4.3.1",
 ]
 
 [project.optional-dependencies]

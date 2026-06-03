@@ -1,7 +1,7 @@
 """Wu-style non-invertibility reporting: three correlation distributions + SAR.
 
-The single-template inversion in :mod:`mwf.inversion` quantifies *how close* a
-reconstruction ``x̂ = T⁻¹(y, k)`` is to the original feature vector ``x``. On its
+The single-template inversion ``x̂ = T⁻¹(y, k)`` quantifies *how close* a
+reconstruction is to the original feature vector ``x``. On its
 own, a correlation of ~0.70 looks alarming; what makes it interpretable is the
 side-by-side reference that Wu et al. (TIFS 2019) use as the cancelable-biometrics
 gold standard:
@@ -27,7 +27,7 @@ inflates it toward the GAR.
 Both reports use the multimodal hybrid transform (BioHashing on ECG, IoM on PPG):
 the ECG block is inverted with the min-norm pre-image ``Rᵀ y`` (the same √(m/d)
 leakage as plain BioHashing), the PPG block with
-:func:`mwf.inversion.recover_ppg_iom`'s best-effort winner-direction sum.
+:func:`recover_ppg_iom`'s best-effort winner-direction sum.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ from typing import Final
 import numpy as np
 from joblib import Parallel, delayed
 from numpy.typing import NDArray
+from scipy.stats import pearsonr
 
 from . import iom
 from .batch_utils import DEFAULT_BATCH_N_JOBS
@@ -63,7 +64,6 @@ from .feature_transform import (
     transform_multimodal_batch,
 )
 from .features import extract_features_batch
-from .inversion import _safe_corr, recover_ppg_iom
 from .pipeline import _token_for_label, preprocess_signals
 from .rng import make_rng
 from .scoring import cosine_score_matrix, l2_normalise
@@ -73,6 +73,50 @@ logger = logging.getLogger(__name__)
 DEFAULT_NON_MATED_PAIRS_PER_VICTIM: Final[int] = 8
 _GAP_BOOTSTRAP_RESAMPLES: Final[int] = 1000
 _GAP_BOOTSTRAP_LEVEL: Final[float] = 0.95
+
+
+def _safe_corr(a: NDArray[np.float64], b: NDArray[np.float64]) -> float:
+    """Return ``pearsonr(a, b)``, mapping the degenerate (constant) case to 0.
+
+    Args:
+        a: First 1-D vector.
+        b: Second 1-D vector of equal length.
+
+    Returns:
+        Pearson correlation, or ``0.0`` when either vector is constant.
+    """
+    if a.size < 2 or float(np.std(a)) == 0.0 or float(np.std(b)) == 0.0:
+        return 0.0
+    r, _ = pearsonr(a, b)
+    return float(0.0 if np.isnan(r) else r)
+
+
+def recover_ppg_iom(
+    ppg_features: NDArray[np.float64],
+    token: str,
+    n_hashes: int,
+    window: int = IOM_WINDOW,
+) -> NDArray[np.float64]:
+    """Best-effort adversarial reconstruction of the PPG block from its IoM code.
+
+    With the token, the adversary reproduces each hash's Gaussian matrix and sums
+    the winning direction vectors. The argmax discards magnitudes, so there is no
+    exact pre-image — which is what makes IoM non-invertible.
+
+    Args:
+        ppg_features: 1-D original PPG descriptor block (to read the winners).
+        token: PPG sub-transform token (already salted by the caller).
+        n_hashes: IoM code length ``m``.
+        window: Projections per hash ``q``.
+
+    Returns:
+        1-D best-effort estimate ``x̂_ppg`` of the PPG block.
+    """
+    d = int(ppg_features.shape[0])
+    w = iom.derive_iom(token, d, n_hashes, window)                 # (m, q, d)
+    idx = iom.iom_indices(ppg_features, token, n_hashes, window)   # (m,)
+    winners = w[np.arange(n_hashes), idx]                          # (m, d)
+    return winners.sum(axis=0)
 
 
 def _bootstrap_gap_ci(
@@ -158,8 +202,8 @@ def _reconstruct_features(
 ) -> NDArray[np.float64]:
     """Min-norm pre-image of the multimodal feature vector for every row.
 
-    Mirrors :func:`mwf.inversion.multimodal_leakage_metrics`: the ECG half is
-    recovered with ``Rᵀ y``; the PPG half with the IoM winner-direction sum.
+    The ECG half is recovered with ``Rᵀ y``; the PPG half with the IoM
+    winner-direction sum (:func:`recover_ppg_iom`).
 
     Scope of the claim: this is the *linear / min-norm* inversion, which is a
     **lower bound on attacker capability** — a stronger adversary running a

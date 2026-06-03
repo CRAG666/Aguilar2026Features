@@ -100,7 +100,6 @@ IOM_HASHES_RATIO: Final[float] = 0.25
 
 BOOTSTRAP_CI_LEVEL: Final[float] = 0.95
 BOOTSTRAP_RESAMPLES_EVAL: Final[int] = 2000     # for CV metric CIs
-BOOTSTRAP_RESAMPLES_TIMING: Final[int] = 1000   # for benchmark CIs
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +132,6 @@ DEFAULT_PIPELINE_CONFIG: Final[PipelineConfig] = PipelineConfig()
 __all__ = [
     "BOOTSTRAP_CI_LEVEL",
     "BOOTSTRAP_RESAMPLES_EVAL",
-    "BOOTSTRAP_RESAMPLES_TIMING",
     "DEFAULT_BINARISE",
     "DEFAULT_ECG_CLEAN_METHOD",
     "DEFAULT_N_FOLDS",

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Final
+from typing import Any, Final, cast
 
 import numpy as np
 import pywt
@@ -89,7 +89,9 @@ def max_feature_level(segment_length: int, wavelet: str = DEFAULT_WAVELET) -> in
     """
     if segment_length < 1:
         raise ValueError("segment_length must be ≥ 1.")
-    return pywt.dwt_max_level(segment_length, pywt.Wavelet(wavelet).dec_len)
+    # ``pywt.Wavelet`` is absent from pywt's type stubs though present at runtime.
+    dec_len = cast(Any, pywt).Wavelet(wavelet).dec_len
+    return pywt.dwt_max_level(segment_length, dec_len)
 
 
 def feature_dimension(level: int) -> int:
