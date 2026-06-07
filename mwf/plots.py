@@ -37,7 +37,7 @@ from .operating_curves import (  # noqa: E402
     roc_curve_from_scores,
 )
 
-# {regime label → (genuine scores, impostor scores)}.
+# {regime label -> (genuine scores, impostor scores)}.
 ScorePools = Mapping[str, tuple[NDArray[np.float64], NDArray[np.float64]]]
 
 _DPI = 150
@@ -51,30 +51,39 @@ def _save(fig: plt.Figure, out_path: Path) -> None:
     plt.close(fig)
 
 
-def plot_det_curves(pools: ScorePools, out_path: Path, title: str = "DET") -> None:
+def _annotate(ax: plt.Axes, lines: list[str]) -> None:
+    """Place quantitative annotations in a boxed corner of the axes (no title)."""
+    if not lines:
+        return
+    ax.text(
+        0.97, 0.97, "\n".join(lines), transform=ax.transAxes,
+        ha="right", va="top", fontsize=8,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
+    )
+
+
+def plot_det_curves(pools: ScorePools, out_path: Path) -> None:
     """Overlay per-regime DET curves (log-log FMR vs FNMR)."""
     fig, ax = plt.subplots(figsize=(5.5, 5.5))
     for label, (genuine, impostor) in pools.items():
         det = det_curve_from_scores(genuine, impostor)
         ax.loglog(np.maximum(det.fmr, 1e-6), np.maximum(det.fnmr, 1e-6), label=label)
-    ax.set_xlabel("FMR")
-    ax.set_ylabel("FNMR")
-    ax.set_title(title)
+    ax.set_xlabel("False Match Rate")
+    ax.set_ylabel("False Non-Match Rate")
     ax.grid(True, which="both", linestyle=":")
     ax.legend(fontsize=8)
     _save(fig, out_path)
 
 
-def plot_roc_curves(pools: ScorePools, out_path: Path, title: str = "ROC") -> None:
+def plot_roc_curves(pools: ScorePools, out_path: Path) -> None:
     """Overlay per-regime ROC curves with their verification AUC in the legend."""
     fig, ax = plt.subplots(figsize=(5.5, 5.5))
     for label, (genuine, impostor) in pools.items():
         roc = roc_curve_from_scores(genuine, impostor)
         ax.plot(roc.fpr, roc.tpr, label=f"{label} (AUC = {roc.auc:.4f})")
     ax.plot([0, 1], [0, 1], color="grey", linestyle="--", linewidth=0.8)
-    ax.set_xlabel("False Positive Rate (FMR)")
+    ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate")
-    ax.set_title(title)
     ax.set_xlim(0.0, 1.0)
     ax.set_ylim(0.0, 1.02)
     ax.grid(True, linestyle=":")
@@ -82,7 +91,7 @@ def plot_roc_curves(pools: ScorePools, out_path: Path, title: str = "ROC") -> No
     _save(fig, out_path)
 
 
-def plot_pr_curves(pools: ScorePools, out_path: Path, title: str = "Precision–Recall") -> None:
+def plot_pr_curves(pools: ScorePools, out_path: Path) -> None:
     """Overlay per-regime precision-recall curves with their AP in the legend."""
     fig, ax = plt.subplots(figsize=(5.5, 5.5))
     for label, (genuine, impostor) in pools.items():
@@ -90,7 +99,6 @@ def plot_pr_curves(pools: ScorePools, out_path: Path, title: str = "Precision–
         ax.plot(pr.recall, pr.precision, label=f"{label} (AP = {pr.average_precision:.4f})")
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
-    ax.set_title(title)
     ax.set_xlim(0.0, 1.0)
     ax.set_ylim(0.0, 1.02)
     ax.grid(True, linestyle=":")
@@ -102,15 +110,13 @@ def plot_score_distribution(
     genuine: NDArray[np.float64],
     impostor: NDArray[np.float64],
     out_path: Path,
-    title: str = "Score distribution",
 ) -> None:
     """Plot the genuine/impostor cosine-score KDEs for one regime."""
     fig, ax = plt.subplots(figsize=(6, 4))
-    sns.kdeplot(genuine, ax=ax, label="genuine", fill=True, alpha=0.4)
-    sns.kdeplot(impostor, ax=ax, label="impostor", fill=True, alpha=0.4)
-    ax.set_title(title)
-    ax.set_xlabel("cosine similarity")
-    ax.set_ylabel("density")
+    sns.kdeplot(genuine, ax=ax, label="Genuine", fill=True, alpha=0.4)
+    sns.kdeplot(impostor, ax=ax, label="Impostor", fill=True, alpha=0.4)
+    ax.set_xlabel("Cosine similarity")
+    ax.set_ylabel("Density")
     ax.legend()
     _save(fig, out_path)
 
@@ -143,11 +149,9 @@ def plot_regime_summary(
         label = f"{regime} ({best_clf})"
         axes[0].plot(best[size_col], best["eer_mean"], marker="o", label=label)
         axes[1].plot(best[size_col], best["auc_mean"], marker="o", label=label)
-    axes[0].set(title="EER vs template size (best classifier)",
-                xlabel="Template size", ylabel="EER")
+    axes[0].set(xlabel="Template size", ylabel="EER")
     axes[0].legend(fontsize=8)
-    axes[1].set(title="AUC vs template size (best classifier)",
-                xlabel="Template size", ylabel="AUC")
+    axes[1].set(xlabel="Template size", ylabel="AUC")
     axes[1].legend(fontsize=8)
     _save(fig, out_path)
 
@@ -176,11 +180,10 @@ def plot_classifier_comparison(
         agg = group.groupby(size_col)[["ap_mean", "eer_mean"]].mean().reset_index()
         axes[0].plot(agg[size_col], agg["ap_mean"], marker="o", label=classifier)
         axes[1].plot(agg[size_col], agg["eer_mean"], marker="o", label=classifier)
-    axes[0].set(title=f"AP vs template size — {regime}", xlabel="Template size", ylabel="AP")
+    axes[0].set(xlabel="Template size", ylabel="AP")
     axes[0].legend(fontsize=8)
-    axes[1].set(title=f"EER vs template size — {regime}", xlabel="Template size", ylabel="EER")
+    axes[1].set(xlabel="Template size", ylabel="EER")
     axes[1].legend(fontsize=8)
-    fig.suptitle(f"Classifier comparison — {regime}")
     _save(fig, out_path)
 
 
@@ -195,13 +198,12 @@ def plot_stolen_token_scores(
     out_path: Path,
     eer: float | None = None,
     decidability: float | None = None,
-    title: str = "Stolen-token verification (worst case)",
 ) -> None:
     """Genuine/impostor KDEs under a *shared* (stolen) token.
 
     With the key neutralised, the separation here is carried by the biometric
-    alone — the honest cancelable-security figure. EER and decidability are
-    annotated when provided.
+    alone (the honest cancelable-security figure). EER and decidability are
+    annotated in-axes when provided.
 
     Args:
         genuine: Genuine comparison scores under the stolen token.
@@ -209,19 +211,18 @@ def plot_stolen_token_scores(
         out_path: PNG output path.
         eer: Equal-error rate to annotate (optional).
         decidability: Daugman's ``d'`` to annotate (optional).
-        title: Figure title.
     """
     fig, ax = plt.subplots(figsize=(6, 4))
-    sns.kdeplot(genuine, ax=ax, label="genuine", fill=True, alpha=0.4)
-    sns.kdeplot(impostor, ax=ax, label="impostor", fill=True, alpha=0.4)
-    ax.set_xlabel("similarity score")
-    ax.set_ylabel("density")
+    sns.kdeplot(genuine, ax=ax, label="Genuine", fill=True, alpha=0.4)
+    sns.kdeplot(impostor, ax=ax, label="Impostor", fill=True, alpha=0.4)
+    ax.set_xlabel("Similarity score")
+    ax.set_ylabel("Density")
     annotations = []
     if eer is not None:
         annotations.append(f"EER = {eer:.3f}")
     if decidability is not None:
         annotations.append(f"d' = {decidability:.2f}")
-    ax.set_title(title + (f"  ({', '.join(annotations)})" if annotations else ""))
+    _annotate(ax, annotations)
     ax.legend()
     _save(fig, out_path)
 
@@ -231,7 +232,6 @@ def plot_non_invertibility(
     out_path: Path,
     sar_type1: float | None = None,
     sar_type2: float | None = None,
-    title: str = "Non-invertibility — Wu-style 3-distribution report",
 ) -> None:
     """KDEs of the three Wu-style correlation pools, with SAR annotations.
 
@@ -240,35 +240,34 @@ def plot_non_invertibility(
     onto non-mated; an invertible one pushes mated onto the reference.
 
     Args:
-        pools: ``{"mated", "non_mated", "genuine_ref"}`` → absolute correlation
+        pools: ``{"mated", "non_mated", "genuine_ref"}`` to absolute correlation
             samples.
         out_path: PNG output path.
-        sar_type1: Optional protected-system SAR for the title annotation.
-        sar_type2: Optional raw-feature SAR for the title annotation.
-        title: Figure title (annotations appended).
+        sar_type1: Optional protected-system SAR for the in-axes annotation.
+        sar_type2: Optional raw-feature SAR for the in-axes annotation.
     """
     if not pools:
         return
     fig, ax = plt.subplots(figsize=(6.5, 4.5))
     styles = {
-        "non_mated": ("#9e9e9e", "non-mated (chance baseline)"),
-        "mated": ("#d62728", "mated reconstruction"),
-        "genuine_ref": ("#2ca02c", "genuine reference (intra-subject)"),
+        "non_mated": ("#9e9e9e", "Non-mated (chance baseline)"),
+        "mated": ("#d62728", "Mated reconstruction"),
+        "genuine_ref": ("#2ca02c", "Genuine reference (intra-subject)"),
     }
     for key, (colour, label) in styles.items():
         arr = pools.get(key)
         if arr is None or arr.size < 2:
             continue
         sns.kdeplot(arr, ax=ax, fill=True, alpha=0.35, color=colour, label=label)
-    ax.set_xlabel("|reconstruction ↔ reference| correlation")
-    ax.set_ylabel("density")
+    ax.set_xlabel("Absolute reconstruction-reference correlation")
+    ax.set_ylabel("Density")
     ax.set_xlim(0.0, 1.0)
     annotations = []
     if sar_type1 is not None and np.isfinite(sar_type1):
         annotations.append(f"SAR-I = {sar_type1:.3f}")
     if sar_type2 is not None and np.isfinite(sar_type2):
         annotations.append(f"SAR-II = {sar_type2:.3f}")
-    ax.set_title(title + (f"  ({', '.join(annotations)})" if annotations else ""))
+    _annotate(ax, annotations)
     ax.legend(fontsize=8, loc="upper left")
     ax.grid(True, linestyle=":")
     _save(fig, out_path)

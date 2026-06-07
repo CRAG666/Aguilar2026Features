@@ -35,7 +35,8 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
@@ -44,11 +45,17 @@ from typing import cast
 
 import numpy as np
 import pandas as pd
-from sklearn.base import clone
 
 _PKG_ROOT = Path(__file__).resolve().parents[1]
 if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
+
+# Silence warnings on the console and route unique ones to a file. Installed
+# before importing mwf (→ pyeer) so the import-time deprecation warnings are
+# caught too; the log file is chosen later, once the run tag is known.
+import warning_capture  # noqa: E402
+
+warning_capture.install()
 
 from mwf import (  # noqa: E402
     BiometricSegments,
@@ -57,7 +64,7 @@ from mwf import (  # noqa: E402
     FEATURE_WAVELET,
     KeyMode,
     METRIC_NAMES,
-    build_templates,
+    build_templates_from_features,
     class_score_matrix,
     closed_set_score_pools,
     compare_classifiers,
@@ -69,11 +76,13 @@ from mwf import (  # noqa: E402
     det_curve_from_scores,
     evaluate,
     evaluate_cancelability,
+    extract_features_batch,
     load_bidmc,
     load_mimic100,
     load_ptt_ppg,
     make_pipeline,
     max_feature_level,
+    preprocess_signals,
     nadeau_bengio_ci_mean,
     non_invertibility_analysis,
     rank_k_accuracies,
@@ -83,10 +92,22 @@ from mwf import (  # noqa: E402
     stolen_token_verification,
     subject_holdout,
     summarise_run,
+    TemplateBundle,
     temporal_holdout_per_subject,
     VerificationMode,
 )
 from mwf.batch_utils import parallel_map  # noqa: E402
+from mwf.cancelability import (  # noqa: E402
+    _assemble_cancelability_report,
+    _per_class_abs_corr,
+    _random_tokens,
+    _same_key_genuine_mean,
+    _standardize_columns,
+    _templates_for_token,
+)
+from mwf.pipeline import _single_threaded  # noqa: E402
+from mwf.scoring import genuine_impostor_scores  # noqa: E402
+from mwf.progress import track  # noqa: E402
 from mwf.classifiers import (  # noqa: E402
     CLASSIFIER_NAMES,
     build_classifier,
@@ -151,16 +172,23 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
 
 
 def _configure_logging(verbose: bool) -> None:
-    """Initialise the root logger.
+    """Initialise logging so the run always narrates its current step.
+
+    The root logger follows ``verbose`` (``INFO`` vs ``WARNING``) to gate library
+    chatter, but this driver's own logger is pinned to ``INFO`` regardless so the
+    "Step: …" banners that tell you what stage the run is on always appear — even
+    without ``--verbose`` — alongside the progress bars.
 
     Args:
-        verbose: If ``True`` log at ``INFO``; otherwise at ``WARNING``.
+        verbose: If ``True`` also surface library ``INFO`` logs; otherwise only
+            this driver's step banners and warnings.
     """
     logging.basicConfig(
         level=logging.INFO if verbose else logging.WARNING,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    logger.setLevel(logging.INFO)
 
 
 def _subset_segments(segments: BiometricSegments, max_subjects: int | None) -> BiometricSegments:
@@ -312,98 +340,144 @@ def _verification_metric_row(
     }
 
 
-def _identification_and_verification(
+def _build_bundles(
     segments: BiometricSegments,
     *,
     regimes: tuple[KeyMode, ...],
     feature_levels: tuple[int, ...],
     projection_ratio: float,
     binarise: bool,
-    n_folds: int,
-    split_seeds: tuple[int, ...],
-    run_identification: bool,
-    run_verification: bool,
-    tune: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict[str, CrossValidationResult]]]:
-    """Sweep regimes × feature levels for identification and verification CV.
+) -> tuple[dict[tuple[KeyMode, int], TemplateBundle], dict[int, np.ndarray]]:
+    """Build the BioHashing templates for every ``(regime, level)`` once.
 
-    Args:
-        tune: When ``True``, each classifier is tuned with a group-aware inner CV
-            on every outer fold's train slice (nested CV) — removing the
-            selection-on-the-evaluation-data bias of fixed hyperparameters.
-
-    Returns:
-        Tuple ``(identification_df, verification_df, id_results)``. ``id_results``
-        maps ``"{regime}@L{level}"`` → ``{classifier: CrossValidationResult}`` so
-        the paired significance tests can compare classifiers on identical folds.
-
-    Parallelism: the templates for every ``(regime, level)`` are built once and
-    reused. The whole identification grid (regime × level × classifier) is then
-    cross-validated through a single flat worker pool (:func:`cross_validate_tasks`)
-    so cores stay busy until the last fold, and the independent verification CVs
-    fan out across cores too. Row order, fold splits and aggregates are identical
-    to the previous sequential nested loops.
+    Returns ``(bundles, features_by_level)`` so the caller can cache the
+    already-extracted features and pass them to downstream analyses
+    (cancelability, stolen-token, non-invertibility, figures) instead of
+    re-running NeuroKit cleaning + DWT for each one.
     """
-    id_rows: list[dict] = []
-    ver_rows: list[dict] = []
-    id_results: dict[str, dict[str, CrossValidationResult]] = {}
-
-    # Build the templates for each (regime, level) once; reused by both protocols
-    # (and shared read-only across the worker pool via joblib's memmap).
+    features_by_level = _features_per_level(segments, feature_levels)
     bundles = {
-        (regime, level): build_templates(
-            segments, feature_level=level, projection_ratio=projection_ratio,
-            binarise=binarise, key_mode=regime,
+        (regime, level): build_templates_from_features(
+            features_by_level[level], segments.labels,
+            key_mode=regime, projection_ratio=projection_ratio, binarise=binarise,
         )
         for regime in regimes
         for level in feature_levels
     }
+    return bundles, features_by_level
 
-    if run_identification:
-        # One task per (regime, level, classifier); a single pool covers them all.
-        tasks = [
-            CVTask(
-                key=(regime, level, name),
-                bundle=bundles[(regime, level)],
-                classifier_name=name,
-                classifier=build_classifier(name),
-                param_grid=build_param_grid(name) if tune else None,
-            )
-            for regime in regimes
-            for level in feature_levels
-            for name in CLASSIFIER_NAMES
-        ]
-        results = cross_validate_tasks(
-            tasks, n_folds=n_folds, split_seeds=split_seeds, ranks=RANK_TARGETS,
+
+def _features_per_level(
+    segments: BiometricSegments, feature_levels: tuple[int, ...],
+) -> dict[int, np.ndarray]:
+    """Clean the cohort once and extract features once per DWT level.
+
+    Cleaning (NeuroKit) and DWT extraction are the dominant per-cohort costs and
+    depend only on the signals / level — never on the key regime — so this caches
+    them for callers that sweep regimes (or analyses) over one cohort. Pair with
+    :func:`build_templates_from_features` to apply the cheap cancelable transform
+    per regime without re-cleaning. Results are byte-identical to per-bundle
+    :func:`build_templates`.
+    """
+    ecg, ppg = preprocess_signals(
+        segments.ecg, segments.ppg, sampling_rate=segments.sampling_rate,
+    )
+    return {
+        level: extract_features_batch(ecg, ppg, wavelet=FEATURE_WAVELET, level=level)
+        for level in feature_levels
+    }
+
+
+def _identification_tasks(
+    bundles: dict[tuple[KeyMode, int], TemplateBundle],
+    *,
+    regimes: tuple[KeyMode, ...],
+    feature_levels: tuple[int, ...],
+    tune: bool,
+) -> list[CVTask]:
+    """Build one :class:`CVTask` per ``(regime, level, classifier)``.
+
+    The grid is returned flat (keyed by ``(regime, level, name)``) so several
+    cohorts' grids can be merged into a single worker pool — one scheduling tail
+    for the whole battery instead of one per dataset.
+
+    Args:
+        tune: When ``True`` each task carries the classifier's hyperparameter grid
+            so every outer fold is tuned with a group-aware inner CV (nested CV),
+            removing the selection-on-the-evaluation-data bias of fixed configs.
+    """
+    return [
+        CVTask(
+            key=(regime, level, name),
+            bundle=bundles[(regime, level)],
+            classifier_name=name,
+            classifier=build_classifier(name),
+            param_grid=build_param_grid(name) if tune else None,
         )
-        for task, result in zip(tasks, results):
-            regime, level, name = cast(tuple[KeyMode, int, str], task.key)
-            id_results.setdefault(f"{regime.value}@L{level}", {})[name] = result
-            id_rows.append(
-                _identification_metric_row(regime.value, level, name, result, tuned=tune)
-            )
+        for regime in regimes
+        for level in feature_levels
+        for name in CLASSIFIER_NAMES
+    ]
 
-    if run_verification:
-        # Each (regime, level, mode) verification CV is independent → fan out.
-        # The bundle travels inside the work item (not a closure) so joblib only
-        # ships each template matrix to the worker that needs it.
-        ver_keys = [
-            (regime, level, mode)
-            for regime in regimes
-            for level in feature_levels
-            for mode in VERIFICATION_MODES
-        ]
-        ver_items = [(bundles[(regime, level)], mode) for regime, level, mode in ver_keys]
-        vers = parallel_map(
-            ver_items,
-            lambda item: run_verification_cv(item[0], mode=item[1], n_folds=n_folds),
+
+def _assemble_identification(
+    tasks: Sequence[CVTask],
+    results: Sequence[CrossValidationResult],
+    *,
+    tuned: bool,
+) -> tuple[pd.DataFrame, dict[str, dict[str, CrossValidationResult]]]:
+    """Flatten this cohort's pooled CV results into its metrics frame + map.
+
+    Args:
+        tasks: The cohort's identification tasks, in submission order.
+        results: The :class:`CrossValidationResult` per task, aligned with ``tasks``.
+        tuned: Whether the classifiers were tuned (recorded on each row).
+
+    Returns:
+        Tuple ``(identification_df, id_results)``; ``id_results`` maps
+        ``"{regime}@L{level}"`` → ``{classifier: result}`` so the paired
+        significance tests compare classifiers on identical folds.
+    """
+    id_rows: list[dict] = []
+    id_results: dict[str, dict[str, CrossValidationResult]] = {}
+    for task, result in zip(tasks, results):
+        regime, level, name = cast(tuple[KeyMode, int, str], task.key)
+        id_results.setdefault(f"{regime.value}@L{level}", {})[name] = result
+        id_rows.append(
+            _identification_metric_row(regime.value, level, name, result, tuned=tuned)
         )
-        ver_rows = [
-            _verification_metric_row(regime.value, level, mode, ver, n_folds=n_folds)
-            for (regime, level, mode), ver in zip(ver_keys, vers)
-        ]
+    return pd.DataFrame(id_rows), id_results
 
-    return pd.DataFrame(id_rows), pd.DataFrame(ver_rows), id_results
+
+def _verification_df(
+    bundles: dict[tuple[KeyMode, int], TemplateBundle],
+    *,
+    regimes: tuple[KeyMode, ...],
+    feature_levels: tuple[int, ...],
+    n_folds: int,
+) -> pd.DataFrame:
+    """Fan the independent ``(regime, level, mode)`` verification CVs over cores.
+
+    The bundle travels inside the work item (not a closure) so joblib only ships
+    each template matrix to the worker that needs it. Row order, fold splits and
+    aggregates are identical to the previous sequential nested loops.
+    """
+    ver_keys = [
+        (regime, level, mode)
+        for regime in regimes
+        for level in feature_levels
+        for mode in VERIFICATION_MODES
+    ]
+    ver_items = [(bundles[(regime, level)], mode) for regime, level, mode in ver_keys]
+    vers = parallel_map(
+        ver_items,
+        lambda item: run_verification_cv(item[0], mode=item[1], n_folds=n_folds),
+        desc="Verification CV",
+    )
+    return pd.DataFrame([
+        _verification_metric_row(regime.value, level, mode, ver, n_folds=n_folds)
+        for (regime, level, mode), ver in zip(ver_keys, vers)
+    ])
 
 
 def _cancelability_df(
@@ -414,13 +488,96 @@ def _cancelability_df(
     binarise: bool,
     n_keys: int,
     seed: int,
+    features_by_level: dict[int, np.ndarray] | None = None,
 ) -> pd.DataFrame:
-    """Run the ISO/IEC 30136 cancelability protocol per feature level."""
+    """Run the ISO/IEC 30136 cancelability protocol per feature level.
+
+    Flattens the (level × token) space into one joblib pool: features are
+    extracted once per level, base templates are built once per level
+    (sequential, cheap), then all n_levels × (n_keys − 1) token jobs run
+    concurrently.  Results are assembled per level after the pool drains;
+    the bootstrap CIs run sequentially on the collected arrays.  CSVs are
+    byte-identical to the old sequential implementation under OMP=1.
+    """
+    from collections import defaultdict
+
+    from joblib import Parallel, delayed, parallel_config
+    from mwf.progress import tqdm_joblib
+
+    if features_by_level is None:
+        features_by_level = _features_per_level(segments, feature_levels)
+    tokens = _random_tokens(n_keys, seed=seed)
+    labels = segments.labels
+    n_subjects = max(1, int(np.unique(labels).size))
+
+    # Build base templates per level (sequential; one BioHashing call per level).
+    bases_by_level: dict[int, tuple[np.ndarray, float, np.ndarray]] = {}
+    for level in feature_levels:
+        base = _templates_for_token(
+            features_by_level[level], tokens[0], projection_ratio, binarise,
+        )
+        bases_by_level[level] = (
+            base,
+            _same_key_genuine_mean(base, labels),
+            _standardize_columns(base),
+        )
+
+    # One job per (level, token) pair — n_levels × (n_keys − 1) total.
+    # Arrays are top-level positional args so joblib memory-maps them read-only.
+    def _one_token_job(
+        level: int,
+        token: str,
+        feats: np.ndarray,
+        base: np.ndarray,
+        baseline_mean: float,
+        base_z: np.ndarray,
+    ) -> tuple:
+        reissued = _templates_for_token(feats, token, projection_ratio, binarise)
+        mated, non_mated = genuine_impostor_scores(base, reissued, labels)
+        reissued_z = _standardize_columns(reissued)
+        diversity = _per_class_abs_corr(base_z, reissued_z, labels)
+        return level, baseline_mean, mated, non_mated, diversity
+
+    jobs = [
+        (level, tok, features_by_level[level], *bases_by_level[level])
+        for level in feature_levels
+        for tok in tokens[1:]
+    ]
+    n_jobs = len(jobs)
+    with parallel_config(backend="loky", inner_max_num_threads=1), \
+            tqdm_joblib(n_jobs, desc="Cancelability"):
+        raw = Parallel(n_jobs=-1)(
+            delayed(_one_token_job)(level, tok, feats, base, bm, bz)
+            for level, tok, feats, base, bm, bz in jobs
+        )
+
+    # Collect per-level arrays in tokens[1:] order (preserved by joblib).
+    groups: dict[int, dict] = {
+        lv: {"renew": [], "mated": [], "non_mated": [], "div": [], "bm": None}
+        for lv in feature_levels
+    }
+    for level, baseline_mean, mated, non_mated, diversity in raw:
+        g = groups[level]
+        g["renew"].append(mated)
+        g["mated"].append(mated)
+        g["non_mated"].append(non_mated)
+        g["div"].append(diversity)
+        g["bm"] = baseline_mean
+
     rows = []
     for level in feature_levels:
-        report = evaluate_cancelability(
-            segments, feature_level=level, projection_ratio=projection_ratio,
-            binarise=binarise, n_keys=n_keys, seed=seed,
+        g = groups[level]
+        base_shape = bases_by_level[level][0].shape
+        report = _assemble_cancelability_report(
+            n_keys=n_keys,
+            renew_per_key=g["renew"],
+            mated_pool=g["mated"],
+            non_mated_pool=g["non_mated"],
+            diversity_per_key=g["div"],
+            baseline_mean=g["bm"],
+            template_dim=int(base_shape[1]),
+            segs_per_subject=base_shape[0] / n_subjects,
+            seed=seed,
         )
         rows.append({"feature_level": level, **asdict(report)})
     return pd.DataFrame(rows)
@@ -434,6 +591,7 @@ def _non_invertibility_outputs(
     binarise: bool,
     max_victims: int | None,
     seed: int,
+    features: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, np.ndarray]]:
     """Wu-style non-invertibility: aggregate report + per-pool sample frame.
 
@@ -451,6 +609,7 @@ def _non_invertibility_outputs(
         binarise=binarise,
         max_victims=max_victims,
         seed=seed,
+        features=features,
     )
     report_df = pd.DataFrame([{
         "feature_level": feature_level,
@@ -476,14 +635,33 @@ def _stolen_token_df(
     projection_ratio: float,
     binarise: bool,
     seed: int,
+    features_by_level: dict[int, np.ndarray] | None = None,
 ) -> pd.DataFrame:
-    """Worst-case (stolen-key) EER per feature level and score-normalisation."""
-    rows = []
-    for level in feature_levels:
+    """Worst-case (stolen-key) EER per feature level and score-normalisation.
+
+    Features are cleaned+extracted once per level and reused for both
+    score-normalisations (the front-end is token- and norm-independent), so the
+    two ``score_norm`` runs of a level no longer re-clean the cohort. The
+    ``(level, score_norm)`` evaluations are independent, so they fan out across
+    cores; the work list keeps the original ``level`` → ``score_norm`` nesting
+    order, so the CSV is byte-identical to the sequential loops. The per-level
+    feature matrix rides inside the work item so joblib memory-maps it once and
+    shares it read-only across the two norm jobs.
+    """
+    if features_by_level is None:
+        features_by_level = _features_per_level(segments, feature_levels)
+
+    # Iterate (level, norm) sequentially so the per-victim Parallel pool inside
+    # stolen_token_score_pools fires at the top level and fills all 64 cores.
+    # A parallel_map outer loop suppresses that inner pool via joblib nesting and
+    # leaves most cores idle (14 outer jobs × 1 core each vs 64-core victim pool).
+    rows: list[dict] = []
+    for level in track(feature_levels, desc="Stolen-token levels"):
+        feats = features_by_level[level]
         for score_norm in (None, "znorm"):
             r = stolen_token_verification(
                 segments, feature_level=level, projection_ratio=projection_ratio,
-                binarise=binarise, seed=seed, score_norm=score_norm,
+                binarise=binarise, seed=seed, score_norm=score_norm, features=feats,
             )
             rows.append({
                 "feature_level": level,
@@ -517,37 +695,64 @@ def _holdout_df(
     The pre-projection standardiser is fitted on the **train** split only and
     reused on the test split, so the held-out templates never see their own
     statistics (leakage-free).
+
+    Parallelism: the train/test templates are built once per ``(regime, level)``
+    (each build self-parallelises its feature extraction), then the independent
+    ``(regime, level, classifier)`` fit/score jobs fan out across cores. Row order
+    matches the sequential nested loops, so ``holdout.csv`` is byte-identical;
+    each classifier is forced single-threaded so the fan-out owns the cores.
     """
     split = temporal_holdout_per_subject(segments, test_fraction=test_fraction)
-    rows = []
-    for regime in regimes:
-        for level in feature_levels:
-            train_b = build_templates(
-                split.train, feature_level=level, projection_ratio=projection_ratio,
-                binarise=binarise, key_mode=regime,
-            )
-            test_b = build_templates(
-                split.test, feature_level=level, projection_ratio=projection_ratio,
-                binarise=binarise, key_mode=regime, scaler=train_b.scaler,
-            )
-            for name in CLASSIFIER_NAMES:
-                pipe = make_pipeline(clone(build_classifier(name)))
-                pipe.fit(train_b.features, train_b.labels)
-                y_score = class_score_matrix(pipe, test_b.features)
-                classes = np.asarray(pipe.named_steps["clf"].classes_, dtype=np.int64)
-                y_pred = np.asarray(pipe.predict(test_b.features), dtype=np.int64)
-                metrics = evaluate(test_b.labels, y_pred, y_score, classes)
-                ranks = rank_k_accuracies(test_b.labels, y_score, classes)
-                rows.append({
-                    "regime": regime.value,
-                    "feature_level": level,
-                    "classifier": name,
-                    "n_train": int(train_b.features.shape[0]),
-                    "n_test": int(test_b.features.shape[0]),
-                    **metrics.as_dict(),
-                    **ranks,
-                })
-    return pd.DataFrame(rows)
+    # Clean + extract each split once per level (regime-independent), then build
+    # the train/test templates per (regime, level) from the cached features; the
+    # scaler is fitted on train and reused on test (leakage-free). Reused by every
+    # classifier. Byte-identical to the old per-bundle build.
+    train_feats = _features_per_level(split.train, feature_levels)
+    test_feats = _features_per_level(split.test, feature_levels)
+    bundles: dict[tuple[KeyMode, int], tuple[TemplateBundle, TemplateBundle]] = {
+        (regime, level): (
+            train_b := build_templates_from_features(
+                train_feats[level], split.train.labels,
+                key_mode=regime, projection_ratio=projection_ratio, binarise=binarise,
+            ),
+            build_templates_from_features(
+                test_feats[level], split.test.labels,
+                key_mode=regime, projection_ratio=projection_ratio, binarise=binarise,
+                scaler=train_b.scaler,
+            ),
+        )
+        for regime in regimes
+        for level in feature_levels
+    }
+    jobs = [
+        (regime, level, name, *bundles[(regime, level)])
+        for regime in regimes
+        for level in feature_levels
+        for name in CLASSIFIER_NAMES
+    ]
+
+    def _fit_eval(
+        job: tuple[KeyMode, int, str, TemplateBundle, TemplateBundle],
+    ) -> dict:
+        regime, level, name, train_b, test_b = job
+        pipe = make_pipeline(_single_threaded(build_classifier(name)))
+        pipe.fit(train_b.features, train_b.labels)
+        y_score = class_score_matrix(pipe, test_b.features)
+        classes = np.asarray(pipe.named_steps["clf"].classes_, dtype=np.int64)
+        y_pred = np.asarray(pipe.predict(test_b.features), dtype=np.int64)
+        metrics = evaluate(test_b.labels, y_pred, y_score, classes)
+        ranks = rank_k_accuracies(test_b.labels, y_score, classes)
+        return {
+            "regime": regime.value,
+            "feature_level": level,
+            "classifier": name,
+            "n_train": int(train_b.features.shape[0]),
+            "n_test": int(test_b.features.shape[0]),
+            **metrics.as_dict(),
+            **ranks,
+        }
+
+    return pd.DataFrame(parallel_map(jobs, _fit_eval, desc="Temporal holdout"))
 
 
 def _subject_holdout_df(
@@ -568,6 +773,11 @@ def _subject_holdout_df(
     top of internal CV. Only the 1:1 verification protocol is reported: closed-set
     identification on unseen subjects is undefined (their classes never appear in
     any training set), so reporting it would be meaningless.
+
+    Parallelism: each ``(regime, level)`` test bundle is built once, then the
+    independent ``(regime, level, mode)`` verification CVs fan out across cores
+    (the same pattern as the main verification sweep). Row order, splits and
+    aggregates match the sequential loops, so ``subject_holdout.csv`` is identical.
     """
     split = subject_holdout(segments, test_fraction=test_fraction, seed=seed)
     n_test_subjects = int(np.unique(split.test.labels).size)
@@ -582,39 +792,59 @@ def _subject_holdout_df(
             n_test_subjects,
         )
         return pd.DataFrame()
-    rows = []
-    for regime in regimes:
-        for level in feature_levels:
-            test_b = build_templates(
-                split.test, feature_level=level, projection_ratio=projection_ratio,
-                binarise=binarise, key_mode=regime,
-            )
-            for mode in ("closed_set", "open_set"):
-                try:
-                    ver = run_verification_cv(test_b, mode=mode, n_folds=eff_folds)
-                except ValueError as exc:  # degenerate split (too few groups/blocks)
-                    logger.warning(
-                        "Subject-holdout %s verification skipped (%s).", mode, exc,
-                    )
-                    continue
-                eer = ver.eer_values()
-                deci = ver.decidability_values()
-                finite_eer = eer[np.isfinite(eer)]
-                eer_ci_lo, eer_ci_hi = nadeau_bengio_ci_mean(
-                    finite_eer, n_folds=eff_folds,
-                ) if finite_eer.size > 1 else (float("nan"), float("nan"))
-                rows.append({
-                    "regime": regime.value,
-                    "feature_level": level,
-                    "verification_mode": mode,
-                    "n_test_subjects": n_test_subjects,
-                    "n_folds": ver.n_folds,
-                    "eer_mean": float(np.nanmean(eer)),
-                    "eer_std": float(np.nanstd(eer, ddof=1)) if eer.size > 1 else 0.0,
-                    "eer_ci_lo": eer_ci_lo,
-                    "eer_ci_hi": eer_ci_hi,
-                    "decidability_mean": float(np.nanmean(deci)),
-                })
+    # Clean + extract the held-out cohort once per level, then build each
+    # (regime, level) test bundle from the cached features; reused across both
+    # modes. Byte-identical to the old per-bundle build.
+    test_feats = _features_per_level(split.test, feature_levels)
+    test_bundles = {
+        (regime, level): build_templates_from_features(
+            test_feats[level], split.test.labels,
+            key_mode=regime, projection_ratio=projection_ratio, binarise=binarise,
+        )
+        for regime in regimes
+        for level in feature_levels
+    }
+    jobs = [
+        (regime, level, mode, test_bundles[(regime, level)])
+        for regime in regimes
+        for level in feature_levels
+        for mode in ("closed_set", "open_set")
+    ]
+
+    def _verify(
+        job: tuple[KeyMode, int, str, TemplateBundle],
+    ) -> tuple[str, ...] | tuple[str, dict]:
+        regime, level, mode, test_b = job
+        try:
+            ver = run_verification_cv(test_b, mode=mode, n_folds=eff_folds)
+        except ValueError as exc:  # degenerate split (too few groups/blocks)
+            return ("skipped", mode, str(exc))
+        eer = ver.eer_values()
+        deci = ver.decidability_values()
+        finite_eer = eer[np.isfinite(eer)]
+        eer_ci_lo, eer_ci_hi = nadeau_bengio_ci_mean(
+            finite_eer, n_folds=eff_folds,
+        ) if finite_eer.size > 1 else (float("nan"), float("nan"))
+        return ("ok", {
+            "regime": regime.value,
+            "feature_level": level,
+            "verification_mode": mode,
+            "n_test_subjects": n_test_subjects,
+            "n_folds": ver.n_folds,
+            "eer_mean": float(np.nanmean(eer)),
+            "eer_std": float(np.nanstd(eer, ddof=1)) if eer.size > 1 else 0.0,
+            "eer_ci_lo": eer_ci_lo,
+            "eer_ci_hi": eer_ci_hi,
+            "decidability_mean": float(np.nanmean(deci)),
+        })
+
+    rows: list[dict] = []
+    for status, *payload in parallel_map(jobs, _verify, desc="Subject holdout"):
+        if status == "skipped":
+            mode, exc = payload
+            logger.warning("Subject-holdout %s verification skipped (%s).", mode, exc)
+        else:
+            rows.append(payload[0])
     return pd.DataFrame(rows)
 
 
@@ -630,16 +860,20 @@ def _cross_activity_df(
     """Verify each activity's probes against the enrol-activity centroid.
 
     One row per probe activity plus a within-condition reference; empty for
-    single-recording cohorts. Sibling activities are loaded on demand.
+    single-recording cohorts. Activities are iterated sequentially so the
+    per-victim Parallel pool inside cross_session_score_pools fires at the
+    top level and fills all 64 cores (outer activity parallelism would suppress
+    the inner pool via joblib nesting, leaving most cores idle).
     """
     if spec.enrol_activity is None or spec.load_activity is None:
         return pd.DataFrame()
-    rows = []
-    for activity in (spec.enrol_activity, *spec.probe_activities):
+    activities = (spec.enrol_activity, *spec.probe_activities)
+    rows: list[dict] = []
+    for activity in track(list(activities), desc="Cross-activity"):
         within = activity == spec.enrol_activity
         probe_segments = (
             enrol_segments if within
-            else _subset_segments(spec.load_activity(activity), max_subjects)
+            else _subset_segments(spec.load_activity(activity), max_subjects)  # type: ignore[misc]
         )
         r = cross_session_verification(
             enrol_segments, probe_segments,
@@ -684,6 +918,7 @@ def _plot_figures(
     non_invertibility_report: dict | None = None,
     plot_stolen_token: bool = False,
     seed: int = 42,
+    cached_features: np.ndarray | None = None,
 ) -> None:
     """Render the full figure suite (curves, score KDEs, metric + cancelability).
 
@@ -710,22 +945,33 @@ def _plot_figures(
             their genuine/impostor distributions (the worst-case figure).
         seed: Seed forwarded to the stolen-token pooling.
     """
-    pools: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    for regime in regimes:
-        bundle = build_templates(
-            segments, feature_level=feature_level,
-            projection_ratio=projection_ratio, binarise=binarise, key_mode=regime,
-        )
-        pools[regime.value] = closed_set_score_pools(bundle, n_folds=n_folds)
+    from joblib import Parallel, delayed, parallel_config
 
-    suffix = f"feat_lvl={feature_level}"
-    plot_det_curves(pools, fig_dir / "det.png", title=f"DET — {suffix}")
-    plot_roc_curves(pools, fig_dir / "roc.png", title=f"ROC — {suffix}")
-    plot_pr_curves(pools, fig_dir / "pr.png", title=f"Precision–Recall — {suffix}")
+    features = (
+        cached_features
+        if cached_features is not None
+        else _features_per_level(segments, (feature_level,))[feature_level]
+    )
+
+    def _regime_pools(regime: KeyMode) -> tuple[str, tuple[np.ndarray, np.ndarray]]:
+        bundle = build_templates_from_features(
+            features, segments.labels,
+            key_mode=regime, projection_ratio=projection_ratio, binarise=binarise,
+        )
+        return regime.value, closed_set_score_pools(bundle, n_folds=n_folds)
+
+    with parallel_config(backend="loky", inner_max_num_threads=1):
+        regime_results = Parallel(n_jobs=-1)(
+            delayed(_regime_pools)(regime) for regime in regimes
+        )
+    pools: dict[str, tuple[np.ndarray, np.ndarray]] = dict(regime_results)
+
+    plot_det_curves(pools, fig_dir / "det.png")
+    plot_roc_curves(pools, fig_dir / "roc.png")
+    plot_pr_curves(pools, fig_dir / "pr.png")
     for regime_label, (genuine, impostor) in pools.items():
         plot_score_distribution(
             genuine, impostor, fig_dir / f"scores_{regime_label}.png",
-            title=f"Score distribution — {regime_label} | {suffix}",
         )
 
     if not id_df.empty:
@@ -840,18 +1086,52 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     return args
 
 
-def run_dataset(
+@dataclass(frozen=True, slots=True)
+class DatasetWork:
+    """A prepared cohort awaiting (and then carrying) its pooled CV results.
+
+    Produced by :func:`_prepare_dataset` (load → templates → identification task
+    list). The identification grids of *all* cohorts are then cross-validated
+    through one flat pool, and :func:`_finish_dataset` turns each cohort's slice
+    of those results into its CSVs, figures and headline summary.
+
+    Attributes:
+        spec: The cohort being evaluated.
+        segments: Its loaded ECG/PPG segments.
+        regimes: Key regimes swept for this cohort.
+        out_dir: Per-dataset output directory.
+        feature_levels: DWT depths swept (derived from this cohort's segments).
+        representative_level: Deepest level, used by the single-level analyses.
+        bundles: Templates per ``(regime, level)``, shared by both protocols.
+        id_tasks: The flat identification grid (empty when identification is off).
+    """
+
+    spec: DatasetSpec
+    segments: BiometricSegments
+    regimes: tuple[KeyMode, ...]
+    out_dir: Path
+    feature_levels: tuple[int, ...]
+    representative_level: int
+    bundles: dict[tuple[KeyMode, int], TemplateBundle]
+    features_by_level: dict[int, np.ndarray]
+    id_tasks: tuple[CVTask, ...]
+
+
+def _prepare_dataset(
     spec: DatasetSpec,
     segments: BiometricSegments,
     *,
     args: argparse.Namespace,
     regimes: tuple[KeyMode, ...],
     out_dir: Path,
-) -> dict[str, object]:
-    """Run the configured analysis blocks for one cohort, writing to ``out_dir``.
+) -> DatasetWork:
+    """Set up one cohort: feature levels, templates and the identification grid.
 
     Feature levels are derived from this cohort's own segment length, so no config
-    bleeds across datasets.
+    bleeds across datasets. The templates are built once (reused by both protocols)
+    and the flat identification task list is assembled, but no CV is run — that is
+    pooled across every cohort by :func:`main`, so cores stay full across the
+    unequal cohorts instead of draining on each dataset's tail.
 
     Args:
         spec: The cohort being evaluated.
@@ -861,7 +1141,7 @@ def run_dataset(
         out_dir: Per-dataset output directory.
 
     Returns:
-        A one-row headline summary for the cross-dataset comparison table.
+        A :class:`DatasetWork` ready for the pooled CV and :func:`_finish_dataset`.
     """
     if args.feature_levels:
         feature_levels = tuple(args.feature_levels)
@@ -877,6 +1157,46 @@ def run_dataset(
     _write_manifest(
         out_dir, args, n_segments=segments.num_segments, n_subjects=segments.num_subjects,
     )
+    bundles, features_by_level = _build_bundles(
+        segments, regimes=regimes, feature_levels=feature_levels,
+        projection_ratio=args.projection_ratio, binarise=args.binarise,
+    )
+    id_tasks = (
+        tuple(_identification_tasks(
+            bundles, regimes=regimes, feature_levels=feature_levels, tune=args.tune,
+        ))
+        if args.protocol in ("identification", "both") else ()
+    )
+    return DatasetWork(
+        spec=spec, segments=segments, regimes=regimes, out_dir=out_dir,
+        feature_levels=feature_levels, representative_level=representative_level,
+        bundles=bundles, features_by_level=features_by_level, id_tasks=id_tasks,
+    )
+
+
+def _finish_dataset(
+    work: DatasetWork,
+    id_results_raw: Sequence[CrossValidationResult],
+    *,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    """Turn one cohort's pooled CV results into its CSVs, figures and summary.
+
+    Args:
+        work: The prepared cohort (templates, identification tasks, output dir).
+        id_results_raw: This cohort's slice of the pooled identification results,
+            aligned with ``work.id_tasks`` (empty when identification is off).
+        args: Parsed CLI options.
+
+    Returns:
+        A one-row headline summary for the cross-dataset comparison table.
+    """
+    spec = work.spec
+    segments = work.segments
+    regimes = work.regimes
+    out_dir = work.out_dir
+    feature_levels = work.feature_levels
+    representative_level = work.representative_level
 
     summary: dict[str, object] = {
         "dataset": spec.name,
@@ -886,18 +1206,21 @@ def run_dataset(
         "sampling_rate": segments.sampling_rate,
     }
 
-    id_df, ver_df, id_results = _identification_and_verification(
-        segments,
-        regimes=regimes,
-        feature_levels=feature_levels,
-        projection_ratio=args.projection_ratio,
-        binarise=args.binarise,
-        n_folds=args.cv_folds,
-        split_seeds=tuple(args.split_seeds),
-        run_identification=args.protocol in ("identification", "both"),
-        run_verification=args.protocol in ("verification", "both"),
-        tune=args.tune,
-    )
+    if work.id_tasks:
+        id_df, id_results = _assemble_identification(
+            work.id_tasks, id_results_raw, tuned=args.tune,
+        )
+    else:
+        id_df, id_results = pd.DataFrame(), {}
+
+    if args.protocol in ("verification", "both"):
+        logger.info("[%s] Step: verification CV.", spec.name)
+        ver_df = _verification_df(
+            work.bundles, regimes=regimes, feature_levels=feature_levels,
+            n_folds=args.cv_folds,
+        )
+    else:
+        ver_df = pd.DataFrame()
     _save_csv(id_df, out_dir / "metrics.csv")
     _save_csv(ver_df, out_dir / "verification.csv")
     if not id_df.empty:
@@ -912,27 +1235,33 @@ def run_dataset(
             summary["verification_eer"] = float(closed["eer_mean"].min())
 
     if args.significance and id_results:
+        logger.info("[%s] Step: classifier significance tests.", spec.name)
         _save_csv(
             _significance_df(id_results, n_folds=args.cv_folds),
             out_dir / "significance.csv",
         )
 
     if args.cancelability_keys >= 2:
+        logger.info("[%s] Step: cancelability protocol (%d keys).",
+                    spec.name, args.cancelability_keys)
         _save_csv(
             _cancelability_df(
                 segments, feature_levels=feature_levels,
                 projection_ratio=args.projection_ratio, binarise=args.binarise,
                 n_keys=args.cancelability_keys, seed=args.seed,
+                features_by_level=work.features_by_level,
             ),
             out_dir / "cancelability.csv",
         )
     ni_pools: dict[str, np.ndarray] | None = None
     ni_report: dict | None = None
     if args.non_invertibility:
+        logger.info("[%s] Step: non-invertibility analysis.", spec.name)
         ni_report_df, ni_pools_df, ni_pools = _non_invertibility_outputs(
             segments, feature_level=representative_level,
             projection_ratio=args.projection_ratio, binarise=args.binarise,
             max_victims=args.non_invertibility_victims, seed=args.seed,
+            features=work.features_by_level.get(representative_level),
         )
         _save_csv(ni_report_df, out_dir / "non_invertibility.csv")
         _save_csv(ni_pools_df, out_dir / "non_invertibility_pools.csv")
@@ -941,15 +1270,18 @@ def run_dataset(
             summary["non_invertibility_leakage_gap"] = float(ni_report["leakage_gap"])
             summary["non_invertibility_sar1"] = float(ni_report["sar_type1"])
     if args.stolen_token:
+        logger.info("[%s] Step: stolen-token worst-case EER.", spec.name)
         st_df = _stolen_token_df(
             segments, feature_levels=feature_levels,
             projection_ratio=args.projection_ratio, binarise=args.binarise, seed=args.seed,
+            features_by_level=work.features_by_level,
         )
         _save_csv(st_df, out_dir / "stolen_token.csv")
         raw = st_df[st_df["score_norm"] == "raw"]
         if not raw.empty:
             summary["stolen_token_eer"] = float(raw["eer"].min())
     if spec.enrol_activity is not None and args.cross_activity:
+        logger.info("[%s] Step: cross-activity verification.", spec.name)
         ca_df = _cross_activity_df(
             spec, segments, max_subjects=args.max_subjects,
             projection_ratio=args.projection_ratio, binarise=args.binarise, seed=args.seed,
@@ -959,6 +1291,7 @@ def run_dataset(
         if not cross.empty:
             summary["cross_activity_mean_eer"] = float(cross["eer"].mean())
     if args.holdout:
+        logger.info("[%s] Step: temporal holdout.", spec.name)
         _save_csv(
             _holdout_df(
                 segments, regimes=regimes, feature_levels=(representative_level,),
@@ -968,6 +1301,7 @@ def run_dataset(
             out_dir / "holdout.csv",
         )
     if args.subject_holdout:
+        logger.info("[%s] Step: subject-disjoint holdout.", spec.name)
         _save_csv(
             _subject_holdout_df(
                 segments, regimes=regimes, feature_levels=(representative_level,),
@@ -978,6 +1312,7 @@ def run_dataset(
             out_dir / "subject_holdout.csv",
         )
     if args.det_plots:
+        logger.info("[%s] Step: rendering figure suite.", spec.name)
         _plot_figures(
             segments, id_df, regimes=regimes, feature_level=representative_level,
             projection_ratio=args.projection_ratio, binarise=args.binarise,
@@ -985,6 +1320,7 @@ def run_dataset(
             non_invertibility_pools=ni_pools,
             non_invertibility_report=ni_report,
             plot_stolen_token=args.stolen_token, seed=args.seed,
+            cached_features=work.features_by_level.get(representative_level),
         )
     logger.info("[%s] Done. Outputs under %s", spec.name, out_dir)
     return summary
@@ -1001,6 +1337,13 @@ def main(argv: list[str] | None = None) -> None:
 
     Each dataset writes to ``<output-dir>/<Name>_<date>_<hour>/`` (all sharing one
     run tag); the cross-dataset comparison goes to ``<output-dir>/shared/``.
+
+    The identification grids of *every* cohort are merged into one flat worker
+    pool (a single scheduling tail for the whole battery) instead of one pool per
+    dataset, so cores stay full across the unequal cohorts rather than draining on
+    each dataset's tail. Fold partitions are deterministic per seed and each
+    task's result depends only on its own bundle, so pooling changes wall-clock
+    only — every CSV is byte-identical to evaluating each dataset on its own.
     """
     args = _parse_args(argv)
     _configure_logging(args.verbose)
@@ -1009,18 +1352,63 @@ def main(argv: list[str] | None = None) -> None:
     regimes = tuple(KeyMode(r) for r in args.regimes)
     specs = _resolve_datasets(args.datasets)
     run_tag = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    warnings_log = args.output_dir / f"warnings_{run_tag}.log"
+    warning_capture.set_logfile(warnings_log)
     logger.info(
         "Evaluating %d dataset(s): %s (run tag %s).",
         len(specs), ", ".join(s.name for s in specs), run_tag,
     )
+    logger.info("Console warnings silenced; unique warnings → %s", warnings_log)
 
-    summaries: list[dict[str, object]] = []
-    for spec in specs:
-        segments = _subset_segments(spec.load(), args.max_subjects)
-        out_dir = args.output_dir / f"{spec.name}_{run_tag}"
-        summaries.append(
-            run_dataset(spec, segments, args=args, regimes=regimes, out_dir=out_dir)
+    # Phase 1: load every cohort and build its templates + identification grid.
+    # Loading (disk I/O + WFDB parsing) is parallelised across datasets with
+    # threads; template building (NeuroKit + DWT, already row-parallel) runs
+    # sequentially so each dataset's internal pool keeps all cores.
+    logger.info("Phase 1/3: loading cohorts and building BioHashing templates.")
+
+    def _load_one(spec: DatasetSpec) -> BiometricSegments:
+        logger.info("Loading %s …", spec.name)
+        return _subset_segments(spec.load(), args.max_subjects)
+
+    with ThreadPoolExecutor(max_workers=len(specs)) as pool:
+        loaded_segments = list(pool.map(_load_one, specs))
+
+    works = []
+    for spec, segments in track(zip(specs, loaded_segments), desc="Building templates", total=len(specs)):
+        works.append(
+            _prepare_dataset(
+                spec, segments,
+                args=args, regimes=regimes,
+                out_dir=args.output_dir / f"{spec.name}_{run_tag}",
+            )
         )
+
+    # Phase 2: cross-validate every cohort's identification grid in ONE pool, so
+    # the small cohorts' cores backfill the big cohort's tail instead of idling.
+    all_tasks = [task for work in works for task in work.id_tasks]
+    if all_tasks:
+        logger.info(
+            "Phase 2/3: identification CV over %d task(s), %d fold(s) × %d seed(s).",
+            len(all_tasks), args.cv_folds, len(args.split_seeds),
+        )
+    pooled = (
+        cross_validate_tasks(
+            all_tasks, n_folds=args.cv_folds,
+            split_seeds=tuple(args.split_seeds), ranks=RANK_TARGETS,
+        )
+        if all_tasks else []
+    )
+
+    # Phase 3: hand each cohort its slice of the pooled results and finish it.
+    logger.info("Phase 3/3: per-cohort analyses, CSVs and figures.")
+    summaries: list[dict[str, object]] = []
+    offset = 0
+    for work in works:
+        n_tasks = len(work.id_tasks)
+        summaries.append(
+            _finish_dataset(work, pooled[offset:offset + n_tasks], args=args)
+        )
+        offset += n_tasks
 
     # Shared cross-dataset headline comparison (one row per dataset).
     _save_csv(

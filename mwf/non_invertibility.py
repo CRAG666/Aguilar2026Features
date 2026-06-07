@@ -75,6 +75,29 @@ _GAP_BOOTSTRAP_RESAMPLES: Final[int] = 1000
 _GAP_BOOTSTRAP_LEVEL: Final[float] = 0.95
 
 
+def _batch_abs_pearsonr(
+    A: NDArray[np.float64], B: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Per-row |Pearson r| between matching rows of A and B.
+
+    Vectorised replacement for a Python loop calling :func:`_safe_corr` on
+    individual pairs.  Constant rows (zero variance) return ``0.0``.
+
+    Args:
+        A: ``(n, d)`` matrix.
+        B: ``(n, d)`` matrix with the same shape.
+
+    Returns:
+        ``(n,)`` array of absolute correlations.
+    """
+    A_c = A - A.mean(axis=1, keepdims=True)
+    B_c = B - B.mean(axis=1, keepdims=True)
+    denom = np.sqrt((A_c ** 2).sum(axis=1) * (B_c ** 2).sum(axis=1))
+    valid = denom > 0
+    r = np.where(valid, (A_c * B_c).sum(axis=1) / np.where(valid, denom, 1.0), 0.0)
+    return np.abs(r)
+
+
 def _safe_corr(a: NDArray[np.float64], b: NDArray[np.float64]) -> float:
     """Return ``pearsonr(a, b)``, mapping the degenerate (constant) case to 0.
 
@@ -284,30 +307,36 @@ def _correlation_pools(
     non_mated_pairs_per_victim: int,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     """Build the three Pearson-correlation pools (mated / non-mated / genuine-ref)."""
-    mated: list[float] = []
-    non_mated: list[float] = []
-    genuine_ref: list[float] = []
+    mated_parts: list[NDArray[np.float64]] = []
+    non_mated_parts: list[NDArray[np.float64]] = []
+    genuine_ref_parts: list[NDArray[np.float64]] = []
     for victim in uniq:
         victim_idx = np.flatnonzero(labels == victim)
         other_idx = np.flatnonzero(labels != victim)
-        for i in victim_idx:
-            mated.append(_safe_corr(recovered[i], features[i]))
+        # Mated: vectorised per-row |r| between recovered and original.
+        mated_parts.append(
+            _batch_abs_pearsonr(recovered[victim_idx], features[victim_idx])
+        )
         if other_idx.size and victim_idx.size:
             n_pairs = min(
                 victim_idx.size * non_mated_pairs_per_victim, other_idx.size,
             )
             j_choice = rng.choice(other_idx, size=n_pairs, replace=False)
             i_choice = rng.choice(victim_idx, size=n_pairs, replace=True)
-            for i, j in zip(i_choice, j_choice):
-                non_mated.append(_safe_corr(recovered[i], features[j]))
+            # Non-mated: vectorised per-row |r| between recovered[i] and features[j].
+            non_mated_parts.append(
+                _batch_abs_pearsonr(recovered[i_choice], features[j_choice])
+            )
         if victim_idx.size >= 2:
             perm = rng.permutation(victim_idx)
-            for k in range(perm.size - 1):
-                genuine_ref.append(_safe_corr(features[perm[k]], features[perm[k + 1]]))
+            # Genuine-ref: vectorised consecutive-pair |r|.
+            genuine_ref_parts.append(
+                _batch_abs_pearsonr(features[perm[:-1]], features[perm[1:]])
+            )
     return (
-        np.asarray(mated, dtype=np.float64),
-        np.asarray(non_mated, dtype=np.float64),
-        np.asarray(genuine_ref, dtype=np.float64),
+        np.concatenate(mated_parts) if mated_parts else np.empty(0, dtype=np.float64),
+        np.concatenate(non_mated_parts) if non_mated_parts else np.empty(0, dtype=np.float64),
+        np.concatenate(genuine_ref_parts) if genuine_ref_parts else np.empty(0, dtype=np.float64),
     )
 
 
@@ -382,6 +411,7 @@ def non_invertibility_analysis(
     non_mated_pairs_per_victim: int = DEFAULT_NON_MATED_PAIRS_PER_VICTIM,
     seed: int = DEFAULT_SEED,
     denoise: bool = True,
+    features: NDArray[np.float64] | None = None,
 ) -> tuple[NonInvertibilityReport, dict[str, NDArray[np.float64]]]:
     """Wu-style non-invertibility analysis on the multimodal cohort.
 
@@ -398,17 +428,21 @@ def non_invertibility_analysis(
         non_mated_pairs_per_victim: Cap on the non-mated subsample per victim.
         seed: Master RNG seed.
         denoise: Whether to run NeuroKit cleaning before feature extraction.
+        features: Optional pre-extracted ``(B, d)`` feature matrix aligned with
+            ``segments.labels``. When given, the clean→extract front-end is
+            skipped (same contract as :func:`mwf.stolen_token.stolen_token_score_pools`).
 
     Returns:
         Tuple ``(report, pools)``. ``pools`` maps the three population labels
         (``"mated"``, ``"non_mated"``, ``"genuine_ref"``) to their absolute
         correlations — the raw material the KDE figure consumes.
     """
-    ecg, ppg = preprocess_signals(
-        segments.ecg, segments.ppg, sampling_rate=segments.sampling_rate,
-        snr_db=None, denoise=denoise,
-    )
-    features = extract_features_batch(ecg, ppg, wavelet=feature_wavelet, level=feature_level)
+    if features is None:
+        ecg, ppg = preprocess_signals(
+            segments.ecg, segments.ppg, sampling_rate=segments.sampling_rate,
+            snr_db=None, denoise=denoise,
+        )
+        features = extract_features_batch(ecg, ppg, wavelet=feature_wavelet, level=feature_level)
     labels = segments.labels
     uniq = np.unique(labels)
     rng = make_rng(seed)

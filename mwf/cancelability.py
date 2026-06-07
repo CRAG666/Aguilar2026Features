@@ -378,6 +378,53 @@ def _per_class_abs_corr(
     return np.asarray(corrs, dtype=np.float64)
 
 
+def _assemble_cancelability_report(
+    n_keys: int,
+    renew_per_key: list[NDArray[np.float64]],
+    mated_pool: list[NDArray[np.float64]],
+    non_mated_pool: list[NDArray[np.float64]],
+    diversity_per_key: list[NDArray[np.float64]],
+    baseline_mean: float,
+    template_dim: int,
+    segs_per_subject: float,
+    seed: int,
+) -> "CancelabilityReport":
+    """Build a :class:`CancelabilityReport` from pre-collected per-key arrays.
+
+    Separates CI computation from the per-key loop so the loop can be
+    parallelised externally while the sequential bootstrap runs once after.
+    """
+    boot_rng = make_rng(seed + 101)
+    diversity_arr = np.concatenate(diversity_per_key) if diversity_per_key else np.empty(0)
+    curve = _d_sys_curve(np.concatenate(mated_pool), np.concatenate(non_mated_pool))
+    renew_mean = float(np.concatenate(renew_per_key).mean())
+    renew_ratio = renew_mean / baseline_mean if baseline_mean else float("nan")
+    renew_ci_lo, renew_ci_hi = _bootstrap_key_mean_ci(
+        renew_per_key, boot_rng, scale=baseline_mean if baseline_mean else 1.0,
+    )
+    div_ci_lo, div_ci_hi = _bootstrap_key_mean_ci(diversity_per_key, boot_rng)
+    dsys_ci_lo, dsys_ci_hi = _bootstrap_d_sys_ci(mated_pool, non_mated_pool, boot_rng)
+    chance = _diversity_chance_abs_corr(
+        template_dim=template_dim, segs_per_subject=segs_per_subject,
+    )
+    return CancelabilityReport(
+        n_keys=n_keys,
+        renewability_genuine_mean=renew_mean,
+        renewability_baseline_mean=baseline_mean,
+        renewability_ratio=renew_ratio,
+        renewability_ratio_ci_low=renew_ci_lo,
+        renewability_ratio_ci_high=renew_ci_hi,
+        diversity_mean_abs_corr=float(diversity_arr.mean()) if diversity_arr.size else float("nan"),
+        diversity_std_abs_corr=std_or_zero(diversity_arr),
+        diversity_ci_low=div_ci_lo,
+        diversity_ci_high=div_ci_hi,
+        diversity_chance_abs_corr=chance,
+        unlinkability_d_sys=curve.d_sys,
+        unlinkability_d_sys_ci_low=dsys_ci_lo,
+        unlinkability_d_sys_ci_high=dsys_ci_hi,
+    )
+
+
 @overload
 def evaluate_cancelability(
     segments: BiometricSegments,
@@ -470,43 +517,33 @@ def evaluate_cancelability(
     if not renew_per_key:
         raise ValueError("n_keys must be ≥ 2 to evaluate cancelability.")
 
-    boot_rng = make_rng(seed + 101)
-    diversity_arr = np.concatenate(diversity_per_key) if diversity_per_key else np.empty(0)
-    curve = _d_sys_curve(np.concatenate(mated_pool), np.concatenate(non_mated_pool))
-    renew_mean = float(np.concatenate(renew_per_key).mean())
-    renew_ratio = renew_mean / baseline_mean if baseline_mean else float("nan")
-
-    renew_ci_lo, renew_ci_hi = _bootstrap_key_mean_ci(
-        renew_per_key, boot_rng, scale=baseline_mean if baseline_mean else 1.0,
-    )
-    div_ci_lo, div_ci_hi = _bootstrap_key_mean_ci(diversity_per_key, boot_rng)
-    dsys_ci_lo, dsys_ci_hi = _bootstrap_d_sys_ci(mated_pool, non_mated_pool, boot_rng)
-    chance = _diversity_chance_abs_corr(
+    report = _assemble_cancelability_report(
+        n_keys=n_keys,
+        renew_per_key=renew_per_key,
+        mated_pool=mated_pool,
+        non_mated_pool=non_mated_pool,
+        diversity_per_key=diversity_per_key,
+        baseline_mean=baseline_mean,
         template_dim=int(base.shape[1]),
         segs_per_subject=base.shape[0] / max(1, np.unique(segments.labels).size),
+        seed=seed,
     )
-
-    report = CancelabilityReport(
-        n_keys=n_keys,
-        renewability_genuine_mean=renew_mean,
-        renewability_baseline_mean=baseline_mean,
-        renewability_ratio=renew_ratio,
-        renewability_ratio_ci_low=renew_ci_lo,
-        renewability_ratio_ci_high=renew_ci_hi,
-        diversity_mean_abs_corr=float(diversity_arr.mean()) if diversity_arr.size else float("nan"),
-        diversity_std_abs_corr=std_or_zero(diversity_arr),
-        diversity_ci_low=div_ci_lo,
-        diversity_ci_high=div_ci_hi,
-        diversity_chance_abs_corr=chance,
-        unlinkability_d_sys=curve.d_sys,
-        unlinkability_d_sys_ci_low=dsys_ci_lo,
-        unlinkability_d_sys_ci_high=dsys_ci_hi,
-    )
-    return (report, curve) if return_curve else report
+    if return_curve:
+        curve = _d_sys_curve(
+            np.concatenate(mated_pool), np.concatenate(non_mated_pool),
+        )
+        return report, curve
+    return report
 
 
 __all__ = [
     "CancelabilityReport",
     "UnlinkabilityCurve",
+    "_assemble_cancelability_report",
+    "_per_class_abs_corr",
+    "_random_tokens",
+    "_same_key_genuine_mean",
+    "_standardize_columns",
+    "_templates_for_token",
     "evaluate_cancelability",
 ]

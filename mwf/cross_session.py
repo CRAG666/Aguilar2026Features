@@ -14,9 +14,11 @@ from dataclasses import dataclass
 from typing import Final
 
 import numpy as np
+from joblib import Parallel, delayed, parallel_config
 from numpy.typing import NDArray
 from pyeer.eer_info import get_eer_stats
 
+from .batch_utils import DEFAULT_BATCH_N_JOBS
 from .constants import (
     DEFAULT_BINARISE,
     DEFAULT_ECG_CLEAN_METHOD,
@@ -180,9 +182,33 @@ def cross_session_score_pools(
     scaler = FeatureScaler.fit(enrol_features)
 
     rng = make_rng(seed)
-    genuine_pool: list[NDArray[np.float64]] = []
-    impostor_pool: list[NDArray[np.float64]] = []
-    for victim in common:
+
+    # Filter valid victims first (skip RNG advance for skipped subjects).
+    valid_common = [
+        v for v in common
+        if np.flatnonzero(probe_labels == v).size > 0
+        and np.flatnonzero(probe_labels != v).size > 0
+    ]
+
+    # Pre-generate per-victim RNG state sequentially so parallel workers
+    # receive deterministic, pre-computed values — bit-identical to the old
+    # sequential loop under OMP=1.
+    victim_cohort_perms: dict[int, np.ndarray | None] = {}
+    for victim in valid_common:
+        if score_norm == "znorm":
+            other_probe = np.flatnonzero(probe_labels != victim)
+            other_subjects = np.unique(probe_labels[other_probe])
+            victim_cohort_perms[victim] = (
+                rng.permutation(other_subjects.size)
+                if other_subjects.size >= 2 else None
+            )
+        else:
+            victim_cohort_perms[victim] = None
+
+    def _one_victim(
+        victim: int,
+        cohort_perm: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
         token = _token_for_label(int(victim))
         enrol_mask = enrol_labels == victim
         enrol_templates = transform_multimodal_batch(
@@ -201,19 +227,35 @@ def cross_session_score_pools(
 
         victim_probe = np.flatnonzero(probe_labels == victim)
         other_probe = np.flatnonzero(probe_labels != victim)
-        if victim_probe.size == 0 or other_probe.size == 0:
-            continue
         gen = cosine_score_matrix(probe_n[victim_probe], centroid).ravel()
         if score_norm == "znorm":
-            cohort_idx, scored_idx = _split_impostor_cohort(other_probe, probe_labels, rng)
-            cohort_scores = cosine_score_matrix(probe_n[cohort_idx], centroid).ravel()
-            imp = cosine_score_matrix(probe_n[scored_idx], centroid).ravel()
+            other_subjects = np.unique(probe_labels[other_probe])
+            if cohort_perm is not None and other_subjects.size >= 2:
+                n_cohort = max(1, other_subjects.size // 2)
+                cohort_subjects = other_subjects[cohort_perm[:n_cohort]]
+                in_cohort = np.isin(probe_labels[other_probe], cohort_subjects)
+                c_idx = other_probe[in_cohort]
+                s_idx = other_probe[~in_cohort]
+            else:
+                c_idx, s_idx = other_probe, other_probe
+            cohort_scores = cosine_score_matrix(probe_n[c_idx], centroid).ravel()
+            imp = cosine_score_matrix(probe_n[s_idx], centroid).ravel()
             gen, imp = znorm(gen, cohort_scores), znorm(imp, cohort_scores)
         else:
             imp = cosine_score_matrix(probe_n[other_probe], centroid).ravel()
-        genuine_pool.append(gen)
-        impostor_pool.append(imp)
+        return gen, imp
 
+    if not valid_common:
+        raise ValueError("No subject yielded both a genuine probe and an impostor probe.")
+
+    with parallel_config(backend="loky", inner_max_num_threads=1):
+        pairs = Parallel(n_jobs=DEFAULT_BATCH_N_JOBS)(
+            delayed(_one_victim)(victim, victim_cohort_perms[victim])
+            for victim in valid_common
+        )
+
+    genuine_pool = [g for g, _ in pairs]
+    impostor_pool = [i for _, i in pairs]
     if not genuine_pool:
         raise ValueError("No subject yielded both a genuine probe and an impostor probe.")
     return np.concatenate(genuine_pool), np.concatenate(impostor_pool)

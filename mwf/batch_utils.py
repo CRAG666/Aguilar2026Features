@@ -7,8 +7,10 @@ from collections.abc import Callable, Sequence
 from typing import Final, TypeVar
 
 import numpy as np
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, parallel_config
 from numpy.typing import NDArray
+
+from .progress import track, tqdm_joblib
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -62,6 +64,7 @@ def parallel_map(
     *,
     n_jobs: int | None = None,
     parallel_threshold: int = 2,
+    desc: str = "tasks",
 ) -> list[R]:
     """Apply ``worker`` to each item of ``items``, preserving input order.
 
@@ -81,6 +84,7 @@ def parallel_map(
         worker: Pure callable mapping one item to its result.
         n_jobs: Worker count; ``None`` reads :data:`DEFAULT_BATCH_N_JOBS`.
         parallel_threshold: Minimum item count that triggers the joblib pool.
+        desc: Progress-bar label naming the current stage.
 
     Returns:
         ``[worker(x) for x in items]``, computed in parallel when worthwhile.
@@ -88,12 +92,18 @@ def parallel_map(
     items = list(items)
     effective_n_jobs = DEFAULT_BATCH_N_JOBS if n_jobs is None else n_jobs
     if effective_n_jobs == 1 or len(items) < parallel_threshold:
-        return [worker(x) for x in items]
-    return list(
-        Parallel(n_jobs=effective_n_jobs, prefer="processes")(
-            delayed(worker)(x) for x in items
+        return [worker(x) for x in track(items, desc=desc)]
+    # inner_max_num_threads=1 pins each worker's BLAS to one thread: it stops the
+    # workers from collectively oversubscribing the cores (dozens of processes ×
+    # 64 BLAS threads) and keeps reduction orders fixed, so a worker's result is
+    # bit-identical to the sequential path regardless of the pool size.
+    with parallel_config(backend="loky", inner_max_num_threads=1), \
+            tqdm_joblib(len(items), desc=desc):
+        return list(
+            Parallel(n_jobs=effective_n_jobs)(
+                delayed(worker)(x) for x in items
+            )
         )
-    )
 
 
 __all__ = [

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import cache
 from itertools import islice
+from types import MappingProxyType
 from typing import Final, NamedTuple
 
 import numpy as np
@@ -52,6 +53,7 @@ from .features import extract_features_batch, feature_dimension
 from .metrics import ClassificationMetrics, evaluate
 from .noise import add_awgn_batch
 from .operating_curves import DEFAULT_RANKS, rank_k_accuracies
+from .progress import track, tqdm_joblib
 
 logger = logging.getLogger(__name__)
 
@@ -268,11 +270,67 @@ def build_templates(
         ecg, ppg, wavelet=feature_wavelet, level=feature_level,
     )
 
+    bundle = build_templates_from_features(
+        features,
+        segments.labels,
+        key_mode=key_mode,
+        projection_ratio=projection_ratio,
+        binarise=binarise,
+        standardize=standardize,
+        scaler=scaler,
+    )
+    logger.info(
+        "Built %d templates [feat=%s J=%d | regime=%s | ratio=%.2f binarise=%s std=%s] → %d dims.",
+        bundle.features.shape[0],
+        feature_wavelet,
+        feature_level,
+        key_mode.value,
+        projection_ratio,
+        binarise,
+        standardize,
+        bundle.features.shape[1],
+    )
+    return bundle
+
+
+def build_templates_from_features(
+    features: NDArray[np.float64],
+    labels: NDArray[np.int64],
+    *,
+    key_mode: KeyMode = KeyMode.PER_SUBJECT,
+    projection_ratio: float = DEFAULT_PROJECTION_RATIO,
+    binarise: bool = DEFAULT_BINARISE,
+    standardize: bool = DEFAULT_STANDARDIZE,
+    scaler: FeatureScaler | None = None,
+) -> TemplateBundle:
+    """Apply the cancelable transform to already-extracted features.
+
+    The clean→extract front-end of :func:`build_templates` depends only on the
+    signals and DWT level, never on the key regime, so a caller sweeping several
+    regimes over one cohort can extract the features **once** and call this per
+    regime — skipping the redundant NeuroKit cleaning and DWT that otherwise
+    dominate a multi-regime sweep. For a given ``features`` the result is
+    byte-identical to :func:`build_templates`.
+
+    Args:
+        features: ``(B, d)`` multimodal feature matrix (ECG‖PPG).
+        labels: ``(B,)`` subject labels aligned with ``features``.
+        key_mode: Key regime (see :class:`KeyMode`).
+        projection_ratio: BioHashing template length as a fraction ``m/d``.
+        binarise: Whether to sign-binarise the BioHashing projection.
+        standardize: Whether to z-score before the projection when no ``scaler``
+            is supplied (ignored for :attr:`KeyMode.IDENTITY`).
+        scaler: Optional pre-fitted scaler; overrides ``standardize`` and is
+            applied verbatim (the leakage-free held-out path).
+
+    Returns:
+        A :class:`TemplateBundle` ready for CV.
+    """
     effective_scaler: FeatureScaler | None = None
     if key_mode == KeyMode.IDENTITY:
         templates = features
     else:
-        tokens = _tokens_for(segments.labels, key_mode)
+        tokens = _tokens_for(labels, key_mode)
         assert tokens is not None
         # Fit the standardiser on this cohort only when one is not supplied, so
         # a held-out cohort can reuse the train-fitted scaler (leakage-free).
@@ -288,21 +346,9 @@ def build_templates(
             standardize=False,
             scaler=effective_scaler,
         )
-
-    logger.info(
-        "Built %d templates [feat=%s J=%d | regime=%s | ratio=%.2f binarise=%s std=%s] → %d dims.",
-        templates.shape[0],
-        feature_wavelet,
-        feature_level,
-        key_mode.value,
-        projection_ratio,
-        binarise,
-        standardize,
-        templates.shape[1],
-    )
     return TemplateBundle(
         features=templates,
-        labels=segments.labels.copy(),
+        labels=labels.copy(),
         key_mode=key_mode,
         scaler=effective_scaler,
     )
@@ -573,14 +619,49 @@ class _FoldJob(NamedTuple):
     groups: NDArray[np.int64] | None
 
 
+# Coarse relative cost of a single fold fit, keyed by classifier class name, used
+# only to order the work for longest-first scheduling, never affects results.
+# Neural nets and forests dominate; trees and linear models are cheap.
+_CLASSIFIER_COST_WEIGHTS: Final[Mapping[str, float]] = MappingProxyType({
+    "MLPClassifier": 20.0,
+    "RandomForestClassifier": 8.0,
+    "SVC": 4.0,
+    "DecisionTreeClassifier": 1.0,
+    "LogisticRegression": 1.0,
+})
+
+
+def _job_cost(job: _FoldJob) -> float:
+    """Rough relative cost of one fold job, for longest-processing-time scheduling.
+
+    A scheduling hint only; it never affects results. Combines the train-slice
+    size, the tuning-grid cardinality (the dominant ``--tune`` multiplier: e.g.
+    MLP's 12 configs vs LR's 4) and a coarse per-classifier weight, so the heavy
+    MLP/RF fits start before the cheap LR/DT ones and the short jobs backfill the
+    tail, tightening the makespan of the flat pool.
+    """
+    grid_card = 1
+    if job.param_grid:
+        for values in job.param_grid.values():
+            grid_card *= len(values)
+    weight = _CLASSIFIER_COST_WEIGHTS.get(type(job.classifier).__name__, 1.0)
+    return job.train_idx.shape[0] * grid_card * weight
+
+
 def _evaluate_fold_jobs(
     jobs: Sequence[_FoldJob], *, ranks: tuple[int, ...], n_jobs: int | None,
+    desc: str = "CV folds",
 ) -> list[FoldEvaluation]:
     """Evaluate fold jobs, sequentially or over one loky pool, preserving order.
 
     The single scheduling point for every CV path: callers flatten their grid
     into ``jobs`` and get results back in the same order, so sequential and
     parallel execution are byte-identical.
+
+    In the parallel path the jobs are *dispatched* heaviest-first (see
+    :func:`_job_cost`) so the long MLP/RF folds do not strand cores in the tail,
+    then the results are un-permuted back to input order: the longest-first
+    schedule changes only wall-clock, never the returned values or their order.
 
     The array fields are passed to :func:`joblib.delayed` *individually* (not as
     the whole ``_FoldJob``): joblib only memory-maps arrays that are top-level
@@ -595,21 +676,30 @@ def _evaluate_fold_jobs(
                 j.features, j.labels, j.train_idx, j.test_idx, j.classifier, ranks,
                 param_grid=j.param_grid, groups=j.groups,
             )
-            for j in jobs
+            for j in track(jobs, desc=desc)
         ]
+    # Longest-processing-time-first: dispatch the costliest folds before the cheap
+    # ones so idle workers backfill the tail. ``sorted`` is stable, so equal-cost
+    # jobs keep input order and the schedule stays deterministic. The original
+    # index rides along so results can be un-permuted back to input order.
+    ordered = sorted(enumerate(jobs), key=lambda t: _job_cost(t[1]), reverse=True)
     # inner_max_num_threads=1 prevents CPU oversubscription (and keeps BLAS
     # reduction orders stable for reproducibility) when workers call into
     # multithreaded libraries.
-    with parallel_config(backend="loky", inner_max_num_threads=1):
-        return list(
+    with parallel_config(backend="loky", inner_max_num_threads=1), \
+            tqdm_joblib(len(ordered), desc=desc):
+        dispatched = list(
             Parallel(n_jobs=effective_n_jobs)(
                 delayed(_fit_eval_fold_full)(
-                    j.features, j.labels, j.train_idx, j.test_idx, j.classifier,
-                    ranks, j.param_grid, j.groups,
+                    job.features, job.labels, job.train_idx, job.test_idx,
+                    job.classifier, ranks, job.param_grid, job.groups,
                 )
-                for j in jobs
+                for _idx, job in ordered
             )
         )
+    # Un-permute: restore input order so callers see schedule-independent output.
+    indices = (idx for idx, _job in ordered)
+    return [r for _, r in sorted(zip(indices, dispatched), key=lambda t: t[0])]
 
 
 def cross_validate_classifier_multiseed(
@@ -740,7 +830,7 @@ def _assemble_cv_result(
 
 
 def _single_threaded(estimator: Classifier) -> Classifier:
-    """Clone ``estimator`` forcing ``n_jobs=1`` when it exposes that parameter.
+    """Clone ``estimator`` forcing ``n_jobs=1`` when it requests multi-core work.
 
     When the outer fold pool already saturates every core, an estimator that
     *also* parallelises internally (e.g. ``RandomForestClassifier(n_jobs=-1)``)
@@ -750,7 +840,12 @@ def _single_threaded(estimator: Classifier) -> Classifier:
     1 leaves every reported number identical while removing the contention.
     """
     est = clone(estimator)
-    if "n_jobs" in est.get_params():
+    # Only constrain estimators that actually request multi-core work (e.g.
+    # ``RandomForestClassifier(n_jobs=-1)``). Skip ``None``/``1``: those are
+    # already single-threaded, and on estimators where ``n_jobs`` is deprecated
+    # and inert (e.g. ``LogisticRegression`` since sklearn 1.8) setting it would
+    # only raise a ``FutureWarning`` while changing nothing.
+    if est.get_params().get("n_jobs") not in (None, 1):
         est.set_params(n_jobs=1)
     return est
 
@@ -783,6 +878,7 @@ def cross_validate_tasks(
     segments_per_block: int = DEFAULT_SEGMENTS_PER_BLOCK,
     ranks: tuple[int, ...] = DEFAULT_RANKS,
     n_jobs: int | None = None,
+    desc: str = "Identification CV",
 ) -> list[CrossValidationResult]:
     """Cross-validate many ``(bundle, classifier)`` tasks over **one** worker pool.
 
@@ -811,6 +907,7 @@ def cross_validate_tasks(
         ranks: Ranks for the per-fold CMC accuracies.
         n_jobs: Worker count; ``None`` reads :data:`CV_N_JOBS` (``1`` runs the
             flat list sequentially).
+        desc: Progress-bar label naming the current stage.
 
     Returns:
         One :class:`CrossValidationResult` per task, in input order.
@@ -834,7 +931,7 @@ def cross_validate_tasks(
             for _seed, _fold_idx, tr, te in specs
         )
 
-    evals = iter(_evaluate_fold_jobs(jobs, ranks=ranks, n_jobs=n_jobs))
+    evals = iter(_evaluate_fold_jobs(jobs, ranks=ranks, n_jobs=n_jobs, desc=desc))
     # Regroup the ordered evaluations back into one result per task.
     return [
         _assemble_cv_result(
@@ -854,6 +951,7 @@ __all__ = [
     "SHARED_TOKEN",
     "TemplateBundle",
     "build_templates",
+    "build_templates_from_features",
     "class_score_matrix",
     "cross_validate_classifier_multiseed",
     "cross_validate_tasks",

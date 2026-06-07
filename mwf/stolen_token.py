@@ -27,9 +27,11 @@ from dataclasses import dataclass
 from typing import Final
 
 import numpy as np
+from joblib import Parallel, delayed, parallel_config
 from numpy.typing import NDArray
 from pyeer.eer_info import get_eer_stats
 
+from .batch_utils import DEFAULT_BATCH_N_JOBS
 from .constants import (
     DEFAULT_BINARISE,
     DEFAULT_ECG_CLEAN_METHOD,
@@ -132,6 +134,7 @@ def stolen_token_score_pools(
     seed: int = DEFAULT_SEED,
     score_norm: str | None = None,
     config: PipelineConfig | None = None,
+    features: NDArray[np.float64] | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Pool genuine/impostor scores under the stolen-key threat model.
 
@@ -160,13 +163,21 @@ def stolen_token_score_pools(
             cohort is what makes z-norm honest — normalising against the scored
             impostors themselves would deflate the EER by construction.
         config: Optional :class:`PipelineConfig` overriding feature/projection knobs.
+        features: Optional pre-extracted ``(B, d)`` feature matrix aligned with
+            ``segments.labels``. When given, the clean→extract front-end is
+            skipped and these features are re-projected per victim — letting a
+            caller that scores the same cohort/level under several ``score_norm``
+            settings clean and extract **once**. Must equal what the front-end
+            would have produced for the same ``feature_level``/``feature_wavelet``
+            (and clean knobs); the result is then identical to recomputing it.
 
     Returns:
         Tuple ``(genuine_scores, impostor_scores)`` pooled across victims.
 
     Raises:
         ValueError: If no subject has ≥ 2 segments (no genuine pair possible),
-            or ``score_norm`` is not a recognised option.
+            ``score_norm`` is not a recognised option, or ``features`` is supplied
+            with a row count that does not match ``segments.labels``.
     """
     if score_norm not in SCORE_NORMS:
         raise ValueError(f"Unknown score_norm {score_norm!r}. Expected one of {SCORE_NORMS}.")
@@ -176,69 +187,112 @@ def stolen_token_score_pools(
         projection_ratio = config.projection_ratio
         binarise = config.binarise
 
-    ecg, ppg = preprocess_signals(
-        segments.ecg,
-        segments.ppg,
-        sampling_rate=segments.sampling_rate,
-        snr_db=snr_db,
-        noise_seed=noise_seed,
-        denoise=denoise,
-        ecg_method=ecg_method,
-        ppg_method=ppg_method,
-    )
-    # Features are token-independent → extract once, re-project per victim.
-    features = extract_features_batch(
-        ecg, ppg, wavelet=feature_wavelet, level=feature_level
-    )
+    if features is None:
+        ecg, ppg = preprocess_signals(
+            segments.ecg,
+            segments.ppg,
+            sampling_rate=segments.sampling_rate,
+            snr_db=snr_db,
+            noise_seed=noise_seed,
+            denoise=denoise,
+            ecg_method=ecg_method,
+            ppg_method=ppg_method,
+        )
+        # Features are token-independent → extract once, re-project per victim.
+        features = extract_features_batch(
+            ecg, ppg, wavelet=feature_wavelet, level=feature_level
+        )
+    elif features.shape[0] != segments.labels.shape[0]:
+        raise ValueError(
+            "`features` must have one row per segment in `segments.labels` "
+            f"({features.shape[0]} != {segments.labels.shape[0]})."
+        )
     labels = segments.labels
     uniq = np.unique(labels)
     rng = make_rng(seed)
     if max_victims is not None and max_victims < uniq.size:
         uniq = np.sort(rng.choice(uniq, size=max_victims, replace=False))
 
-    genuine_pool: list[NDArray[np.float64]] = []
-    impostor_pool: list[NDArray[np.float64]] = []
-    for victim in uniq:
-        victim_mask = labels == victim
-        victim_idx = np.flatnonzero(victim_mask)
-        if victim_idx.size < _MIN_VICTIM_SEGMENTS:
-            continue
+    # Filter valid victims first (no rng advance for skipped ones).
+    valid_uniq = [v for v in uniq if np.flatnonzero(labels == v).size >= _MIN_VICTIM_SEGMENTS]
 
-        tokens = [_token_for_label(int(victim))] * labels.shape[0]
+    # Pre-generate all per-victim rng values sequentially so the parallel
+    # workers receive deterministic, pre-computed state — results are
+    # bit-identical to the old sequential loop under OMP=1.
+    victim_perms: dict[int, np.ndarray] = {}
+    victim_cohort_perms: dict[int, np.ndarray | None] = {}
+    for victim in valid_uniq:
+        victim_idx = np.flatnonzero(labels == victim)
+        victim_perms[victim] = rng.permutation(victim_idx.size)
+        if score_norm == "znorm":
+            other_subjects = np.unique(labels[np.flatnonzero(labels != victim)])
+            victim_cohort_perms[victim] = (
+                rng.permutation(other_subjects.size)
+                if other_subjects.size >= 2 else None
+            )
+        else:
+            victim_cohort_perms[victim] = None
+
+    def _one_victim(
+        victim: int,
+        victim_idx: np.ndarray,
+        perm: np.ndarray,
+        cohort_perm: np.ndarray | None,
+        features: np.ndarray,
+        labels: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        tok = [_token_for_label(int(victim))] * labels.shape[0]
         templates = transform_multimodal_batch(
-            features, tokens, projection_ratio=projection_ratio, binarise=binarise,
+            features, tok, projection_ratio=projection_ratio, binarise=binarise,
         )
         feats_n = l2_normalise(templates)
-
-        perm = rng.permutation(victim_idx.size)
-        n_enrol = int(round(enrol_fraction * victim_idx.size))
-        n_enrol = min(max(n_enrol, 1), victim_idx.size - 1)
+        n_enrol = min(max(int(round(enrol_fraction * victim_idx.size)), 1), victim_idx.size - 1)
         enrol_idx = victim_idx[perm[:n_enrol]]
         query_idx = victim_idx[perm[n_enrol:]]
-
         centroid, _ = compute_subject_centroids(feats_n[enrol_idx], labels[enrol_idx])
         gen = cosine_score_matrix(feats_n[query_idx], centroid).ravel()
-        other_idx = np.flatnonzero(~victim_mask)
+        other_idx = np.flatnonzero(labels != victim)
         if score_norm == "znorm":
-            # Z-norm statistics MUST come from an impostor cohort disjoint from
-            # the scored impostors; estimating μ/σ from the very scores being
-            # normalised (znorm(imp, imp)) forces the impostor distribution to
-            # mean 0 / unit std by construction and optimistically deflates the
-            # EER. Split the impostor *subjects* into a held-out cohort (μ/σ) and
-            # a disjoint scored set, so the reported EER is honest.
-            cohort_idx, scored_idx = _split_impostor_cohort(other_idx, labels, rng)
-            cohort_scores = cosine_score_matrix(feats_n[cohort_idx], centroid).ravel()
-            imp = cosine_score_matrix(feats_n[scored_idx], centroid).ravel()
+            # Z-norm: split impostors into a held-out cohort (μ/σ) and a scored
+            # set using the pre-generated permutation — disjoint by subject.
+            other_subjects = np.unique(labels[other_idx])
+            if cohort_perm is not None and other_subjects.size >= 2:
+                n_cohort = max(1, other_subjects.size // 2)
+                cohort_subjects = other_subjects[cohort_perm[:n_cohort]]
+                in_cohort = np.isin(labels[other_idx], cohort_subjects)
+                c_idx = other_idx[in_cohort]
+                s_idx = other_idx[~in_cohort]
+            else:
+                c_idx, s_idx = other_idx, other_idx
+            cohort_scores = cosine_score_matrix(feats_n[c_idx], centroid).ravel()
+            imp = cosine_score_matrix(feats_n[s_idx], centroid).ravel()
             gen, imp = znorm(gen, cohort_scores), znorm(imp, cohort_scores)
         else:
             imp = cosine_score_matrix(feats_n[other_idx], centroid).ravel()
-        genuine_pool.append(gen)
-        impostor_pool.append(imp)
+        return gen, imp
 
-    if not genuine_pool:
+    if not valid_uniq:
         raise ValueError(
             "Stolen-token verification needs ≥ 2 segments for at least one subject."
         )
+
+    # Dispatch one job per victim; features are a top-level arg so joblib
+    # memory-maps the array read-only across all workers.
+    with parallel_config(backend="loky", inner_max_num_threads=1):
+        pairs = Parallel(n_jobs=DEFAULT_BATCH_N_JOBS)(
+            delayed(_one_victim)(
+                victim,
+                np.flatnonzero(labels == victim),
+                victim_perms[victim],
+                victim_cohort_perms[victim],
+                features,
+                labels,
+            )
+            for victim in valid_uniq
+        )
+
+    genuine_pool = [g for g, _ in pairs]
+    impostor_pool = [i for _, i in pairs]
     return np.concatenate(genuine_pool), np.concatenate(impostor_pool)
 
 
