@@ -73,6 +73,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 .pypirc
-.claude/
-.agents/
+**/.claude/
+**/.agents/
 results/
+**/.a5c
