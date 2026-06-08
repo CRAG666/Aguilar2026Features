@@ -322,7 +322,10 @@ def _correlation_pools(
                 victim_idx.size * non_mated_pairs_per_victim, other_idx.size,
             )
             j_choice = rng.choice(other_idx, size=n_pairs, replace=False)
-            i_choice = rng.choice(victim_idx, size=n_pairs, replace=True)
+            # Tile victim segments so each gets ≈equal representation instead of
+            # sampling with replacement (which over-represents some segments).
+            repeats = (n_pairs + victim_idx.size - 1) // victim_idx.size
+            i_choice = rng.permutation(np.tile(victim_idx, repeats))[:n_pairs]
             # Non-mated: vectorised per-row |r| between recovered[i] and features[j].
             non_mated_parts.append(
                 _batch_abs_pearsonr(recovered[i_choice], features[j_choice])
@@ -367,6 +370,31 @@ def _attack_pairs(
     np.fill_diagonal(same, False)
     off_diagonal = ~np.eye(labels.size, dtype=bool)
     return sim[same], sim[~same & off_diagonal]
+
+
+def _centroid_attack_pairs(
+    templates: NDArray[np.float64],
+    labels: NDArray[np.int64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Genuine / impostor scores using the per-victim L2-normalised centroid matcher.
+
+    Derives the genuine/impostor pools from the same centroid matcher that
+    :func:`_sar` uses, so the EER threshold is consistent with the operating
+    point at which SAR is evaluated.
+    """
+    templates_n = l2_normalise(templates)
+    genuine_parts: list[NDArray[np.float64]] = []
+    impostor_parts: list[NDArray[np.float64]] = []
+    for victim in np.unique(labels):
+        mask = labels == victim
+        centroid = l2_normalise(templates_n[mask].mean(axis=0, keepdims=True))
+        scores = (templates_n @ centroid.T).ravel()
+        genuine_parts.append(scores[mask])
+        impostor_parts.append(scores[~mask])
+    return (
+        np.concatenate(genuine_parts) if genuine_parts else np.empty(0, dtype=np.float64),
+        np.concatenate(impostor_parts) if impostor_parts else np.empty(0, dtype=np.float64),
+    )
 
 
 def _sar(
@@ -478,11 +506,13 @@ def non_invertibility_analysis(
         recovered, tokens, projection_ratio=projection_ratio, binarise=binarise,
         scaler=scaler,
     )
-    gen_p, imp_p = _attack_pairs(protected, labels)
+    # Derive thresholds from the centroid matcher used by _sar, so sar_type1/2
+    # are evaluated at the true EER operating point of the actual matcher.
+    gen_p, imp_p = _centroid_attack_pairs(protected, labels)
     eer_p, thr_p = _eer_threshold(gen_p, imp_p)
     sar1 = _sar(protected, rec_protected, labels, uniq, thr_p)
 
-    gen_raw, imp_raw = _attack_pairs(features, labels)
+    gen_raw, imp_raw = _centroid_attack_pairs(features, labels)
     eer_raw, thr_raw = _eer_threshold(gen_raw, imp_raw)
     sar2 = _sar(features, recovered, labels, uniq, thr_raw)
 

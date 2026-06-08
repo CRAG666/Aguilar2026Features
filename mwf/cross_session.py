@@ -216,11 +216,13 @@ def cross_session_score_pools(
                 in_cohort = np.isin(probe_labels[other_probe], cohort_subjects)
                 c_idx = other_probe[in_cohort]
                 s_idx = other_probe[~in_cohort]
+                cohort_scores = cosine_score_matrix(probe_n[c_idx], centroid).ravel()
+                imp = cosine_score_matrix(probe_n[s_idx], centroid).ravel()
+                gen, imp = znorm(gen, cohort_scores), znorm(imp, cohort_scores)
             else:
-                c_idx, s_idx = other_probe, other_probe
-            cohort_scores = cosine_score_matrix(probe_n[c_idx], centroid).ravel()
-            imp = cosine_score_matrix(probe_n[s_idx], centroid).ravel()
-            gen, imp = znorm(gen, cohort_scores), znorm(imp, cohort_scores)
+                # Only 1 non-victim subject — a disjoint z-norm cohort is impossible.
+                # Self-normalisation would deflate EER by construction; use raw scores.
+                imp = cosine_score_matrix(probe_n[other_probe], centroid).ravel()
         else:
             imp = cosine_score_matrix(probe_n[other_probe], centroid).ravel()
         return gen, imp
@@ -268,9 +270,14 @@ def cross_session_verification(
     )
     stats = get_eer_stats(genuine, impostor)
     eer_ci_low, eer_ci_high = bootstrap_eer_ci(genuine, impostor, seed=seed)
-    n_subjects = int(
-        np.intersect1d(np.unique(enrol_segments.labels), np.unique(probe_segments.labels)).size
-    )
+    # Count only subjects that actually contributed scores (probe segment present +
+    # at least one impostor), not every subject in the label intersection.
+    _pl = probe_segments.labels
+    _common = np.intersect1d(np.unique(enrol_segments.labels), np.unique(_pl))
+    n_subjects = int(sum(
+        1 for v in _common
+        if np.any(_pl == v) and np.any(_pl != v)
+    ))
     result = CrossSessionResult(
         enrol_label=enrol_label,
         probe_label=probe_label,

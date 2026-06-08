@@ -236,11 +236,14 @@ def stolen_token_score_pools(
                 in_cohort = np.isin(labels[other_idx], cohort_subjects)
                 c_idx = other_idx[in_cohort]
                 s_idx = other_idx[~in_cohort]
+                cohort_scores = cosine_score_matrix(feats_n[c_idx], centroid).ravel()
+                imp = cosine_score_matrix(feats_n[s_idx], centroid).ravel()
+                gen, imp = znorm(gen, cohort_scores), znorm(imp, cohort_scores)
             else:
-                c_idx, s_idx = other_idx, other_idx
-            cohort_scores = cosine_score_matrix(feats_n[c_idx], centroid).ravel()
-            imp = cosine_score_matrix(feats_n[s_idx], centroid).ravel()
-            gen, imp = znorm(gen, cohort_scores), znorm(imp, cohort_scores)
+                # Only 1 non-victim subject — a disjoint z-norm cohort is impossible.
+                # Normalising against the scored impostors themselves would deflate
+                # the EER by construction, so fall back to raw scores for this victim.
+                imp = cosine_score_matrix(feats_n[other_idx], centroid).ravel()
         else:
             imp = cosine_score_matrix(feats_n[other_idx], centroid).ravel()
         return gen, imp
