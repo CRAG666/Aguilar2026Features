@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from typing import Final
 
 import numpy as np
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, parallel_config
 from numpy.typing import NDArray
 from scipy.stats import pearsonr
 
@@ -57,6 +57,7 @@ from .constants import (
 from .dataset import BiometricSegments
 from .feature_transform import (
     ECG_SALT,
+    FeatureScaler,
     PPG_SALT,
     _apply,
     derive_projection,
@@ -73,6 +74,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_NON_MATED_PAIRS_PER_VICTIM: Final[int] = 8
 _GAP_BOOTSTRAP_RESAMPLES: Final[int] = 1000
 _GAP_BOOTSTRAP_LEVEL: Final[float] = 0.95
+_RECONSTRUCT_PARALLEL_THRESHOLD: Final[int] = 64
 
 
 def _batch_abs_pearsonr(
@@ -261,16 +263,14 @@ def _reconstruct_features(
         return _reconstruct_chunk(features, tokens, half, m_ecg, n_hashes, window)
     n_workers = n_jobs if n_jobs > 0 else (os.cpu_count() or 1)
     idx_chunks = np.array_split(np.arange(n), min(n_workers, n))
-    chunks = Parallel(n_jobs=n_jobs, prefer="processes")(
-        delayed(_reconstruct_chunk)(
-            features[c], [tokens[j] for j in c], half, m_ecg, n_hashes, window,
+    with parallel_config(backend="loky", inner_max_num_threads=1):
+        chunks = Parallel(n_jobs=n_jobs)(
+            delayed(_reconstruct_chunk)(
+                features[c], [tokens[j] for j in c], half, m_ecg, n_hashes, window,
+            )
+            for c in idx_chunks
         )
-        for c in idx_chunks
-    )
     return np.concatenate(chunks, axis=0)
-
-
-_RECONSTRUCT_PARALLEL_THRESHOLD: Final[int] = 64
 
 
 def _reconstruct_chunk(
@@ -467,11 +467,16 @@ def non_invertibility_analysis(
     # Operating-point references: derive each threshold from the verifier's
     # legitimate genuine/impostor pools (per-subject token for SAR-I; raw
     # features for SAR-II), then ask what fraction of reconstructions pass.
+    # Both protected templates must share the same scaler (fit on original
+    # features) so the SAR-I cosine comparison is in a consistent space.
+    scaler = FeatureScaler.fit(features)
     protected = transform_multimodal_batch(
         features, tokens, projection_ratio=projection_ratio, binarise=binarise,
+        scaler=scaler,
     )
     rec_protected = transform_multimodal_batch(
         recovered, tokens, projection_ratio=projection_ratio, binarise=binarise,
+        scaler=scaler,
     )
     gen_p, imp_p = _attack_pairs(protected, labels)
     eer_p, thr_p = _eer_threshold(gen_p, imp_p)
@@ -481,27 +486,22 @@ def non_invertibility_analysis(
     eer_raw, thr_raw = _eer_threshold(gen_raw, imp_raw)
     sar2 = _sar(features, recovered, labels, uniq, thr_raw)
 
-    def abs_or(a: NDArray[np.float64]) -> NDArray[np.float64]:
-        return np.abs(a) if a.size else a
-
-    mated_abs = abs_or(mated)
-    non_mated_abs = abs_or(non_mated)
-    genuine_ref_abs = abs_or(genuine_ref)
-    gap_ci_low, gap_ci_high = _bootstrap_gap_ci(mated_abs, non_mated_abs, make_rng(seed + 211))
+    # _correlation_pools returns values already absolute (via _batch_abs_pearsonr).
+    gap_ci_low, gap_ci_high = _bootstrap_gap_ci(mated, non_mated, make_rng(seed + 211))
 
     report = NonInvertibilityReport(
         n_victims=int(uniq.size),
         n_mated=int(mated.size),
         n_non_mated=int(non_mated.size),
         n_genuine_ref=int(genuine_ref.size),
-        mated_mean=float(mated_abs.mean()) if mated.size else float("nan"),
-        mated_std=float(mated_abs.std(ddof=1)) if mated.size > 1 else 0.0,
-        non_mated_mean=float(non_mated_abs.mean()) if non_mated.size else float("nan"),
-        non_mated_std=float(non_mated_abs.std(ddof=1)) if non_mated.size > 1 else 0.0,
-        genuine_ref_mean=float(genuine_ref_abs.mean()) if genuine_ref.size else float("nan"),
-        genuine_ref_std=float(genuine_ref_abs.std(ddof=1)) if genuine_ref.size > 1 else 0.0,
+        mated_mean=float(mated.mean()) if mated.size else float("nan"),
+        mated_std=float(mated.std(ddof=1)) if mated.size > 1 else 0.0,
+        non_mated_mean=float(non_mated.mean()) if non_mated.size else float("nan"),
+        non_mated_std=float(non_mated.std(ddof=1)) if non_mated.size > 1 else 0.0,
+        genuine_ref_mean=float(genuine_ref.mean()) if genuine_ref.size else float("nan"),
+        genuine_ref_std=float(genuine_ref.std(ddof=1)) if genuine_ref.size > 1 else 0.0,
         leakage_gap=(
-            float(mated_abs.mean() - non_mated_abs.mean())
+            float(mated.mean() - non_mated.mean())
             if mated.size and non_mated.size else float("nan")
         ),
         leakage_gap_ci_low=gap_ci_low,
@@ -521,9 +521,9 @@ def non_invertibility_analysis(
         report.leakage_gap, report.sar_type1, report.sar_type2,
     )
     return report, {
-        "mated": mated_abs,
-        "non_mated": non_mated_abs,
-        "genuine_ref": genuine_ref_abs,
+        "mated": mated,
+        "non_mated": non_mated,
+        "genuine_ref": genuine_ref,
     }
 
 

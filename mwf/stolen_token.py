@@ -43,7 +43,7 @@ from .constants import (
     PipelineConfig,
 )
 from .dataset import BiometricSegments
-from .feature_transform import transform_multimodal_batch
+from .feature_transform import FeatureScaler, transform_multimodal_batch
 from .features import extract_features_batch
 from .operating_curves import bootstrap_eer_ci, operating_points
 from .pipeline import _token_for_label, preprocess_signals
@@ -85,37 +85,6 @@ class StolenTokenResult:
     genuine_mean: float
     impostor_mean: float
     operating_points: dict[str, float]
-
-
-def _split_impostor_cohort(
-    other_idx: NDArray[np.int64],
-    labels: NDArray[np.int64],
-    rng: np.random.Generator,
-) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-    """Split impostor segment indices into a Z-norm cohort and a scored set.
-
-    The split is by *subject* (never by segment) so no subject straddles the two
-    halves — the cohort that estimates the normalisation statistics shares no
-    identity with the impostors those statistics are applied to.
-
-    Args:
-        other_idx: Segment indices of all non-victim (impostor) segments.
-        labels: Full label array.
-        rng: Seeded generator for the deterministic subject split.
-
-    Returns:
-        Tuple ``(cohort_idx, scored_idx)``. With only one impostor subject the
-        split is impossible, so both fall back to ``other_idx`` (the degenerate
-        single-subject case; immaterial on a real cohort).
-    """
-    other_subjects = np.unique(labels[other_idx])
-    if other_subjects.size < 2:
-        return other_idx, other_idx
-    perm = rng.permutation(other_subjects.size)
-    n_cohort = max(1, other_subjects.size // 2)
-    cohort_subjects = other_subjects[perm[:n_cohort]]
-    in_cohort = np.isin(labels[other_idx], cohort_subjects)
-    return other_idx[in_cohort], other_idx[~in_cohort]
 
 
 def stolen_token_score_pools(
@@ -213,6 +182,9 @@ def stolen_token_score_pools(
     if max_victims is not None and max_victims < uniq.size:
         uniq = np.sort(rng.choice(uniq, size=max_victims, replace=False))
 
+    # Fit once on the full feature matrix — shared by all per-victim projections.
+    scaler = FeatureScaler.fit(features)
+
     # Filter valid victims first (no rng advance for skipped ones).
     valid_uniq = [v for v in uniq if np.flatnonzero(labels == v).size >= _MIN_VICTIM_SEGMENTS]
 
@@ -240,10 +212,12 @@ def stolen_token_score_pools(
         cohort_perm: np.ndarray | None,
         features: np.ndarray,
         labels: np.ndarray,
+        scaler: FeatureScaler,
     ) -> tuple[np.ndarray, np.ndarray]:
         tok = [_token_for_label(int(victim))] * labels.shape[0]
         templates = transform_multimodal_batch(
             features, tok, projection_ratio=projection_ratio, binarise=binarise,
+            scaler=scaler,
         )
         feats_n = l2_normalise(templates)
         n_enrol = min(max(int(round(enrol_fraction * victim_idx.size)), 1), victim_idx.size - 1)
@@ -287,6 +261,7 @@ def stolen_token_score_pools(
                 victim_cohort_perms[victim],
                 features,
                 labels,
+                scaler,
             )
             for victim in valid_uniq
         )

@@ -52,9 +52,10 @@ def parallel_row_map(
         return chunk_worker(signals)
     n_workers = effective_n_jobs if effective_n_jobs > 0 else os.cpu_count() or 1
     chunks = np.array_split(signals, min(n_workers, b), axis=0)
-    results = Parallel(n_jobs=effective_n_jobs, prefer="processes")(
-        delayed(chunk_worker)(c) for c in chunks
-    )
+    with parallel_config(backend="loky", inner_max_num_threads=1):
+        results = Parallel(n_jobs=effective_n_jobs)(
+            delayed(chunk_worker)(c) for c in chunks
+        )
     return np.concatenate(results, axis=0)
 
 

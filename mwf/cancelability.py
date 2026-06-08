@@ -21,7 +21,7 @@ from .constants import (
     PipelineConfig,
 )
 from .dataset import BiometricSegments
-from .feature_transform import transform_multimodal_batch
+from .feature_transform import FeatureScaler, transform_multimodal_batch
 from .features import extract_features_batch
 from .rng import make_rng
 from .scoring import cosine_score_matrix, genuine_impostor_scores
@@ -71,6 +71,7 @@ def _templates_for_token(
     token: str,
     projection_ratio: float,
     binarise: bool,
+    scaler: FeatureScaler | None = None,
 ) -> NDArray[np.float64]:
     """Project every feature row under a shared token and return templates.
 
@@ -79,6 +80,8 @@ def _templates_for_token(
         token: Shared token applied to every row.
         projection_ratio: BioHashing template length ``m / d``.
         binarise: Whether to sign-binarise the projection.
+        scaler: Pre-fitted scaler; when given, bypasses the internal fit-on-input
+            path so the same standardisation is applied across all keys.
 
     Returns:
         ``(n, m)`` template matrix.
@@ -86,6 +89,7 @@ def _templates_for_token(
     tokens = [token] * features.shape[0]
     return transform_multimodal_batch(
         features, tokens, projection_ratio=projection_ratio, binarise=binarise,
+        scaler=scaler,
     )
 
 
@@ -388,11 +392,13 @@ def _assemble_cancelability_report(
     template_dim: int,
     segs_per_subject: float,
     seed: int,
-) -> "CancelabilityReport":
+) -> tuple["CancelabilityReport", "UnlinkabilityCurve"]:
     """Build a :class:`CancelabilityReport` from pre-collected per-key arrays.
 
     Separates CI computation from the per-key loop so the loop can be
     parallelised externally while the sequential bootstrap runs once after.
+    Returns both the report and the underlying :class:`UnlinkabilityCurve` so
+    callers that need the curve do not have to recompute it.
     """
     boot_rng = make_rng(seed + 101)
     diversity_arr = np.concatenate(diversity_per_key) if diversity_per_key else np.empty(0)
@@ -407,7 +413,7 @@ def _assemble_cancelability_report(
     chance = _diversity_chance_abs_corr(
         template_dim=template_dim, segs_per_subject=segs_per_subject,
     )
-    return CancelabilityReport(
+    report = CancelabilityReport(
         n_keys=n_keys,
         renewability_genuine_mean=renew_mean,
         renewability_baseline_mean=baseline_mean,
@@ -423,6 +429,7 @@ def _assemble_cancelability_report(
         unlinkability_d_sys_ci_low=dsys_ci_lo,
         unlinkability_d_sys_ci_high=dsys_ci_hi,
     )
+    return report, curve
 
 
 @overload
@@ -493,8 +500,11 @@ def evaluate_cancelability(
     features = extract_features_batch(
         segments.ecg, segments.ppg, wavelet=feature_wavelet, level=feature_level,
     )
+    # Fit once — features are token-independent so every key would produce an
+    # identical scaler; fitting per call was pure redundant work.
+    scaler = FeatureScaler.fit(features)
     tokens = _random_tokens(n_keys, seed=seed)
-    base = _templates_for_token(features, tokens[0], projection_ratio, binarise)
+    base = _templates_for_token(features, tokens[0], projection_ratio, binarise, scaler=scaler)
     baseline_mean = _same_key_genuine_mean(base, segments.labels)
     base_z = _standardize_columns(base)
 
@@ -504,7 +514,7 @@ def evaluate_cancelability(
     non_mated_pool: list[NDArray[np.float64]] = []
 
     for token in tokens[1:]:
-        reissued = _templates_for_token(features, token, projection_ratio, binarise)
+        reissued = _templates_for_token(features, token, projection_ratio, binarise, scaler=scaler)
         mated, non_mated = genuine_impostor_scores(base, reissued, segments.labels)
         renew_per_key.append(mated)
         mated_pool.append(mated)
@@ -517,7 +527,7 @@ def evaluate_cancelability(
     if not renew_per_key:
         raise ValueError("n_keys must be ≥ 2 to evaluate cancelability.")
 
-    report = _assemble_cancelability_report(
+    report, curve = _assemble_cancelability_report(
         n_keys=n_keys,
         renew_per_key=renew_per_key,
         mated_pool=mated_pool,
@@ -529,9 +539,6 @@ def evaluate_cancelability(
         seed=seed,
     )
     if return_curve:
-        curve = _d_sys_curve(
-            np.concatenate(mated_pool), np.concatenate(non_mated_pool),
-        )
         return report, curve
     return report
 

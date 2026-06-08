@@ -52,8 +52,8 @@ _CV_STRATEGIES: Final = MappingProxyType({
             n_splits=n_splits, shuffle=True, random_state=random_state,
         )
     ),
-    "group_kfold": lambda n_splits, random_state: GroupKFold(n_splits=n_splits),
-    "loso": lambda n_splits, random_state: LeaveOneGroupOut(),
+    "group_kfold": lambda n_splits, _: GroupKFold(n_splits=n_splits),
+    "loso": lambda *_: LeaveOneGroupOut(),
 })
 
 

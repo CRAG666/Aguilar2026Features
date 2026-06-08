@@ -1,196 +1,347 @@
-# aguilar2026features
+# Aguilar2026Features — Cancelable Multimodal Biometrics via Wavelet Features
 
-Cancelable **multimodal (ECG + PPG)** biometric identification where the
-cancelable transform protects the **feature vector** — not the waveform. It is
-the *feature-domain* sibling of `Aguilar2026Wavelet` (which protects the signal
-and then extracts features). The pipeline follows the canonical cancelable-
-biometrics order:
+Cancelable biometric authentication system that applies token-keyed template
+protection to **multimodal ECG + PPG wavelet features**.  The cancelable
+transform operates on the **feature vector** (not the raw signal), making
+revocation cheap and the feature extraction token-independent.
+
+---
+
+## High-level architecture
 
 ```
-Sensor → Preprocessing (opt. AWGN → NeuroKit clean)   ← mwf.clean (ECG neurokit / PPG elgendi)
-       → Extraction (multimodal ECG+PPG feature vector) ← mwf.features (shared.features.wavelet)
-       → Cancelable transform T(x, k)  ← Token k         ← ECG: BioHashing · PPG: IoM hashing
-       → Protected template → cosine matcher / classifier → Decision
+ECG waveform ─┐
+              ├─► Physiological cleaning ─► Wavelet statistical
+PPG waveform ─┘   (NeuroKit2 / Elgendi)    feature extraction
+                                            │
+                                            │  x ∈ ℝ^d  (ECG‖PPG concat)
+                                            ▼
+                              ┌─────────────────────────┐
+                              │  Pre-projection z-score  │  (FeatureScaler, fit
+                              │  standardisation         │   on enrolment cohort)
+                              └────────────┬────────────┘
+                                           │
+                           ┌───────────────┴───────────────┐
+                           │                               │
+                    ECG block  x_E                  PPG block  x_P
+                    (d/2 dims)                      (d/2 dims)
+                           │                               │
+               token + "::ECG"                 token + "::PPG"
+                           │                               │
+                    BioHashing                   Index-of-Max (IoM)
+              R ∈ ℝ^{m×d/2}  (QR)             argmax over q Gaussians
+              y_E = R x_E / ‖R x_E‖           y_P = one-hot(m) / ‖y_P‖
+                           │                               │
+                           └───────────────┬───────────────┘
+                                           │
+                                   T(x, k) ∈ ℝ^{m_E + m_P}
+                              (hybrid protected template)
+                                           │
+                               ┌───────────┴───────────┐
+                               │   Template database   │
+                               └───────────────────────┘
+                                           │
+                              1:1 cosine verification / 1:N identification
 ```
 
-Features are extracted **once** and are token-independent; the cancelable
-transform acts on the feature vector, so a single feature matrix is re-projected
-per token across every regime and analysis.
+The two modalities share a single user **token** `k` (an arbitrary string).
+Salting — `k + "::ECG"` and `k + "::PPP"` — keeps the per-modality random
+material decorrelated while a single token drives the whole template.
 
-## The transform — `mwf.feature_transform`
+---
 
-The protected template is a **per-modality hybrid** of the concatenated ECG‖PPG
-feature vector `x ∈ ℝ^d` under a user token `k`. The token seeds both
-sub-transforms through a SHA-256-derived RNG (`mwf.keystream`), with per-modality
-salts (`::ECG`, `::PPG`) keeping their random material independent.
+## Cancelable transform in detail
 
-* **ECG block → BioHashing** (Teoh 2004). A `d_e × m` Gaussian is QR-orthonormalised
-  into `R` with `R Rᵀ = I_m`; the block template is `R x_ecg`, optionally
-  sign-binarised into a ±1 BioCode. `projection_ratio = m/d_e` (default `0.5`) is
-  the irreversibility budget: the destroyed `(d_e − m)`-dim null space caps the
-  min-norm pre-image leak at ~`√(m/d_e)`.
-* **PPG block → Index-of-Max (IoM) hashing** (`mwf.iom`; Jin et al., *IEEE TIFS*
-  2018). The token seeds `m` Gaussian stacks of `q` (`IOM_WINDOW = 16`) rows each;
-  each hash keeps only the *index of the maximum* response, discarding magnitudes.
-  Codes are returned one-hot, so cosine on the code equals the IoM collision rate
-  and the existing matcher/classifiers apply unchanged. `IOM_HASHES_RATIO = 0.25`.
+### Token-to-projection pipeline (`mwf/keystream.py`, `mwf/feature_transform.py`)
 
-Each block is unit-L2-normalised before concatenation, so cosine fuses the two
-modalities with equal weight. Before projecting, the feature vector is
-per-feature z-scored (`FeatureScaler`, fitted on the enrolment cohort only —
-leakage-free under CV/holdout); the wavelet descriptors span orders of magnitude,
-and without it a shared-token projection is dominated by high-variance bands.
+```
+token  ──► SHA-256(token + salt) ──► SeedSequence ──► Generator
+                                                           │
+                              draw d × m Gaussian  ◄───────┘
+                                       │
+                                    QR(G) ──► R ∈ ℝ^{m×d}  (orthonormal rows)
+```
 
-The PPG block gets the strongly non-invertible IoM because it is the one a linear
-inversion reconstructs at `r ≈ 0.78`. IoM also makes PPG discriminability
-**key-independent**: as an angle-preserving LSH, its collision rate depends on
-the angle between vectors, not on the token — so genuine pairs separate from
-impostors even under a *stolen* token.
+SHA-256 provides **avalanche sensitivity**: a one-bit change in the token
+yields a fully uncorrelated projection, ensuring renewability and cross-token
+diversity (ISO/IEC 30136).  Little-endian byte order is enforced explicitly for
+bit-for-bit reproducibility across platforms.
 
-## Feature extraction — `mwf.features`
+### ECG block — BioHashing (real-valued orthonormal projection)
 
-Each ECG and PPG segment is decomposed with the DWT (**bior3.3**, a linear-phase
-biorthogonal basis that keeps the fiducials aligned) and summarised by **13
-descriptors** per subband (mean, std, var, kurtosis, skewness, energy, entropy,
-max, min, median, iqr, range, mad), via the shared
-`shared.features.wavelet.extract_wavelet_features`. ECG and PPG blocks are
-concatenated, so `d = 2 · 13 · (level + 1)` (e.g. `130` at level 4). Data is
-MIMIC-100, 6-second ECG/PPG segments at 125 Hz (`mwf.dataset`).
+```
+y_E = R_E · x_E,   R_E ∈ ℝ^{m_E × d/2},   R_E R_Eᵀ = I_{m_E}
+```
 
-Two further public cohorts plug into the same pipeline via the shared `Datasets`
-loaders (needs the optional `wfdb` dependency): **BIDMC** (`load_bidmc`, 53
-subjects, ECG+PPG at the same 125 Hz/750-sample shape — a drop-in external
-replication of the MIMIC-100 results), and **PTT-PPG** (`load_ptt_ppg(activity)`,
-22 subjects recorded `sit`/`walk`/`run` at 500 Hz — separate recordings per
-activity that drive the cross-activity protocol below).
+With `m_E = round(ratio × d/2)` (default ratio = 0.5), the protected template
+retains half the original dimensions.  Because `m_E < d/2`, the projection is
+many-to-one: an adversary with both `R_E` and `y_E` can only recover
+`Rᵀy_E` (the min-norm pre-image), which differs from `x_E` by its null-space
+component — leakage bounded by `√(m/d)`.
 
-## Key regimes — `mwf.pipeline.KeyMode`
+### PPG block — Index-of-Max hashing (`mwf/iom.py`)
 
-* `identity` — raw multimodal features (unprotected biometric ceiling).
-* `single_key` — one shared token (biometric-only recognition floor).
-* `per_subject` — one token per subject (operational).
+```
+For i = 1…m:
+    draw window q Gaussian projections {g_{i,j}} seeded by token + "::PPG"
+    h_i(x_P) = argmax_j  g_{i,j}ᵀ x_P          ∈ {0, …, q−1}
 
-## Package layout
+y_P = [one-hot(h_1) ‖ … ‖ one-hot(h_m)]  ∈ {0,1}^{m·q}
+```
+
+IoM discards the magnitude of each projection and keeps only the winning index.
+This yields two properties the plain projection does not have:
+
+| Property | BioHashing | IoM |
+|---|---|---|
+| Non-invertibility | partial (null-space gap) | strong (no linear pre-image) |
+| Similarity preservation | cosine (angle + magnitude) | angle only (key-independent LSH) |
+| Stolen-token leakage | ~√(m/d) from Rᵀy | direction averaged over winners only |
+
+The inner product between two IoM codes counts hash collisions; collision
+probability depends only on the **angle** between the original feature vectors,
+not on the token — so biometric discriminability survives even in the
+stolen-token scenario.
+
+### Pre-projection standardisation (`mwf/feature_transform.py` — `FeatureScaler`)
+
+Wavelet descriptors live on wildly different scales (sub-band energy can exceed
+entropy by several orders of magnitude).  Without equalisation, a random
+projection is dominated by the high-variance descriptors and buries the
+discriminative low-variance ones.  A per-feature z-score — fit on the
+**enrolment cohort only** within each CV fold — restores equal contribution
+before the projection.  The scaler statistics are non-secret (same status as
+the wavelet basis).
+
+---
+
+## Feature extraction (`mwf/features.py`)
+
+```
+segment (ECG, PPG, L samples)
+      │
+      ├─ DWT level-4, wavelet bior3.3 ──► 5 subbands × 13 statistics = 65 ECG descriptors
+      │                                   [mean, std, var, kurtosis, skewness, energy,
+      │                                    entropy, max, min, median, IQR, range, MAD]
+      └─ DWT level-4, wavelet bior3.3 ──► 65 PPG descriptors
+
+feature vector x = [ECG descriptors ‖ PPG descriptors] ∈ ℝ^130
+```
+
+`bior3.3` (biorthogonal 3.3) has symmetric, linear-phase reconstruction filters
+that do not shift ECG/PPG fiducial points, avoiding the small phase distortion
+that orthogonal Daubechies wavelets introduce in morphological statistics.
+
+The decomposition level is a configurable hyperparameter (`PipelineConfig.feature_level`,
+default 4).  `max_feature_level(segment_length, wavelet)` enforces the maximum
+usable depth for a given segment.
+
+---
+
+## Datasets (`mwf/dataset.py`)
+
+| Dataset | Subjects | Segment | fs | Notes |
+|---|---|---|---|---|
+| MIMIC-100 | 100 | 6 s | 125 Hz | single-session intra-session baseline |
+| BIDMC | 53 | 6 s | 125 Hz | external cross-cohort validation |
+| PTT-PPG | 22 | 6 s | 500 Hz | three activities: sit / walk / run |
+
+Each loader returns a `BiometricSegments` frozen dataclass:
+
+```python
+@dataclass(frozen=True)
+class BiometricSegments:
+    ecg:            NDArray  # (N, L)
+    ppg:            NDArray  # (N, L)
+    labels:         NDArray  # (N,) integer subject IDs
+    sampling_rate:  int
+```
+
+---
+
+## Evaluation protocols (`mwf/`)
+
+### Identification — `pipeline.py`
+
+Rank-k accuracy (top-1, top-5, top-10, top-20) under three token regimes:
+
+| `KeyMode` | Token assignment | Evaluates |
+|---|---|---|
+| `IDENTITY` | no transform (raw features) | baseline discriminability |
+| `SINGLE_KEY` | one shared token for all subjects | worst-case privacy |
+| `PER_SUBJECT` | one unique token per subject | operational use case |
+
+Cross-validation uses `StratifiedGroupKFold` / `GroupKFold` / `LeaveOneGroupOut`
+with group = subject ID to prevent identity leakage across folds.  Uncertainty
+is quantified with Nadeau–Bengio corrected 95 % CIs (accounts for train-set
+overlap in repeated CV).
+
+### Verification 1:1 — `verification.py`
+
+Closed-set and open-set EER, decidability index, and DET/ROC operating points.
+Queries are scored against per-subject enrolment centroids using cosine similarity.
+
+### Cancelability — `cancelability.py` (ISO/IEC 30136)
+
+| Metric | Definition | Pass threshold |
+|---|---|---|
+| Renewability ratio | `EER(cross-key genuine) / EER(same-key genuine)` | ≤ 0.05 |
+| Diversity | per-subject template correlation across different tokens | ≤ 1.5 × chance |
+| Unlinkability | Gomez-Barrero D↔sys (global system-level score) | ≤ 0.05 |
+
+Evaluated with 32 independently derived random tokens per subject.
+
+### Non-invertibility — `non_invertibility.py`
+
+Wu-style reporting using Pearson |r| between the reconstructed and original
+feature vectors:
+
+- **mated**: `|corr(x̂_ECG, x_ECG)|` — ECG min-norm pre-image vs original
+- **non-mated**: `|corr(x̂_ECG, x'_ECG)|` — reconstruction vs other subject
+- **genuine_ref**: `|corr(x_a, x_b)|` — two genuine samples of the same subject
+- **leakage_gap** = mated − non-mated (figure of merit; ideal ≈ 0)
+- **SAR** (Success Attack Rate): re-protected reconstruction accepted at EER threshold
+
+PPG inversion uses a best-effort direction sum over IoM winning vectors; no
+magnitude is available, so the recovered direction only partially reconstructs
+`x_P`.
+
+### Stolen-token attack — `stolen_token.py`
+
+Worst-case scenario: the adversary knows the victim's token.  For each victim:
+
+1. All segments (victim + impostors) are re-projected under the **victim's token**.
+2. Victim's own segments form the genuine pool; others form the impostor pool.
+3. Z-norm uses a held-out disjoint cohort to avoid optimistic score normalisation.
+
+Reports EER, decidability, and operating points.  This is the floor on
+verification performance when privacy has been fully compromised.
+
+### Cross-activity — `cross_session.py`
+
+Enrol on one activity / session, probe on another.  Applied to PTT-PPG
+(sit → walk, sit → run, walk → run, and reverses) to quantify intra-subject
+template stability across physiological conditions.
+
+---
+
+## Module map
 
 ```
 mwf/
-  features.py            multimodal wavelet feature extraction (→ shared)
-  feature_transform.py   hybrid transform T(x, k): ECG BioHash ‖ PPG IoM
-  iom.py                 Index-of-Max hashing for the PPG block
-  clean.py               NeuroKit ECG/PPG cleaning (default front-end)
-  noise.py               AWGN injection for robustness runs
-  pipeline.py            preprocess → extract → transform → group-aware CV (nested-CV tuning)
-  classifiers.py         five reference classifiers (MLP/LR/SVM/DT/RF) + tuning grids
-  dataset.py             MIMIC-100 / BIDMC / PTT-PPG loaders + Datasets adapter
-  cross_session.py       cross-activity verification (enrol one condition, probe another)
+├── constants.py          PipelineConfig, all numeric defaults
+├── keystream.py          SHA-256 → SeedSequence → numpy Generator
+├── features.py           DWT statistical feature extraction (ECG + PPG)
+├── feature_transform.py  Hybrid ECG-BioHash / PPG-IoM cancelable transform
+├── iom.py                Index-of-Max hashing implementation
+├── dataset.py            Dataset loaders (MIMIC-100, BIDMC, PTT-PPG)
+├── pipeline.py           End-to-end identification CV pipeline
+├── verification.py       1:1 verification CV
+├── cancelability.py      ISO/IEC 30136 cancelability evaluation
+├── non_invertibility.py  Wu-style non-invertibility reporting
+├── stolen_token.py       Stolen-token worst-case protocol
+├── cross_session.py      Cross-activity / cross-session verification
+├── evaluation.py         CV aggregation, Nadeau-Bengio CI, MetricSummary
+├── metrics.py            Classification metrics (EER, AUC, macro-OVR)
+├── classifiers.py        Five reference classifiers with CV tuning grids
+├── scoring.py            Cosine scoring utilities
+├── operating_curves.py   DET / ROC / PR curve computation
+├── plots.py              Matplotlib figure helpers
+├── noise.py              AWGN injection for SNR-robustness experiments
+├── clean.py              NeuroKit2 / Elgendi signal cleaning wrappers
+├── cv_splits.py          Group-aware CV splitter factories
+├── batch_utils.py        Parallelised batch processing helpers
+├── stats_helpers.py      Bootstrap CI, Nadeau-Bengio correction
+├── significance.py       Statistical significance tests
+├── holdout.py            Held-out cohort management for honest z-norm
+├── progress.py           tqdm progress wrappers
+├── rng.py                Global RNG seed management
+└── validation.py         Input validators (shape, dtype)
 
-  metrics.py             macro one-vs-rest accuracy/bal-acc/AUC/EER/P/R/F1/AP
-  evaluation.py          metric aggregation + Nadeau-Bengio / bootstrap CIs
-  operating_curves.py    DET/ROC/PR, CMC rank-k, operating points (Wilson CIs)
-  verification.py        1:1 closed/open-set EER over CV folds
-  scoring.py             cosine, subject centroids, z-norm, decidability
-
-  cancelability.py       ISO/IEC 30136 renewability / diversity / Gomez-Barrero D_↔^sys
-  non_invertibility.py   Wu-style 3-distribution report + Success-Attack-Rate
-  stolen_token.py        worst-case (stolen-key) EER — the honest figure of merit
-  significance.py        paired Nadeau-Bengio t + Benjamini-Hochberg FDR
-  holdout.py             temporal (within-subject) & subject-disjoint splits
-
-  cv_splits.py keystream.py rng.py stats_helpers.py constants.py
-  batch_utils.py validation.py plots.py
-scripts/run_experiment.py
-tests/                   (per-module pytest suite)
+scripts/
+├── run_experiment.py     Full Q1 evaluation battery (identification + verification
+│                         + cancelability + non-invertibility + stolen-token
+│                         + cross-activity + DET curves), multi-dataset
+└── probe_single_key.py   Hyperparameter probe: how to reach accuracy > 0.90
+                          under the shared-token regime (standardise × ratio sweep)
 ```
 
-## Usage
+---
+
+## Running experiments
+
+### Quick smoke test (8 subjects, MIMIC-100 only)
 
 ```bash
-# from the aguilar2026features/ directory
-uv sync                                   # materialise the pinned environment
-pytest                                    # run the test suite
-
-# experiments — set PYTHONHASHSEED for bit-for-bit reproducibility
-PYTHONHASHSEED=42 python scripts/run_experiment.py -v          # id + verification, every dataset
-PYTHONHASHSEED=42 python scripts/run_experiment.py --all -v    # full battery, every dataset
-PYTHONHASHSEED=42 python scripts/run_experiment.py --datasets bidmc --all -v   # one dataset only
+python scripts/run_experiment.py \
+    --datasets mimic100 \
+    --max-subjects 8 \
+    --cv-folds 3 \
+    --feature-levels 4
 ```
 
-The default run evaluates **every dataset** (`mimic`, `bidmc`, `ptt`), sweeping
-the three regimes over each cohort's usable DWT levels and reporting
-identification + verification CV. Restrict with `--datasets`. Each analysis
-block is opt-in (or all at once with `--all`, which also enables every dataset):
+### Full Q1 evaluation battery
 
-| Flag | Output |
-|---|---|
-| `--datasets {mimic,bidmc,ptt,all}` | which cohorts to evaluate (default `all`) |
-| `--tune` | nested-CV hyperparameter tuning (unbiased; off → fixed reference configs) |
-| `--significance` | paired classifier tests + BH-FDR (`significance.csv`) |
-| `--cancelability-keys K` | ISO/IEC 30136 protocol over `K` keys (`cancelability.csv`) |
-| `--non-invertibility` | Wu 3-distribution + SAR (`non_invertibility*.csv`) |
-| `--stolen-token` | worst-case stolen-key EER (`stolen_token.csv`) |
-| `--cross-activity` | enrol-one / probe-another EER on multi-activity cohorts (`cross_activity.csv`; PTT-PPG only) |
-| `--holdout` / `--subject-holdout` | within-subject / unseen-subject holdout |
-| `--det-plots` | render the figure suite under each dataset's `figures/` |
+```bash
+python scripts/run_experiment.py --all
+```
 
-Other knobs: `--projection-ratio`, `--binarise`, `--regimes`, `--protocol`,
-`--split-seeds`, `--holdout-fraction`, `--seed`. Per-row parallelism is
-controlled by `AGUILAR_FEATURES_N_JOBS` / `AGUILAR_FEATURES_CV_N_JOBS`. Feature
-levels are derived **per dataset** from its own segment length (1..6 at 125 Hz,
-1..8 at 500 Hz), so no config bleeds across cohorts.
+`--all` runs:
+- identification CV + verification CV on MIMIC-100, BIDMC, and PTT-PPG
+- cancelability (32 keys, ISO/IEC 30136)
+- non-invertibility (Wu-style + SAR)
+- stolen-token worst-case
+- cross-activity (PTT-PPG sit / walk / run)
+- DET / ROC curves
 
-### Outputs
+Results land in `results/<Dataset>_<date>_<hour>/` and a cross-dataset headline
+summary in `results/shared/`.
 
-Each dataset writes to its own timestamped folder
-`results/<Name>_<YYYY-MM-DD>_<HH-MM>/` (all datasets of one invocation share the
-run tag), holding `metrics.csv`, `verification.csv`, `significance.csv`,
-`cancelability.csv`, `non_invertibility.csv` (+ `_pools`), `stolen_token.csv`,
-`cross_activity.csv` (PTT-PPG), `holdout.csv`, `subject_holdout.csv`, a
-`figures/` directory, and a `run_manifest.json` (git SHA, full args, dependency
-versions, `uv.lock` hash, dataset shape) tying every CSV to the exact code and
-environment. A cross-dataset headline comparison
-(`dataset_comparison_<run-tag>.csv`) lands in `results/shared/`.
+### Shared-token accuracy probe
 
-Figures land under each dataset folder's `figures/`:
+```bash
+python scripts/probe_single_key.py
+```
 
-* **Recognition** — `det.png`, `roc.png`, `pr.png`, `regime_summary.png`,
-  per-regime `scores_<regime>.png` and `clf_vs_features_<regime>.png`.
-* **Cancelability / security** —
-  `non_invertibility.png` (mated / non-mated / genuine-ref + SAR),
-  `stolen_token_scores.png`.
+Sweeps `(standardise, projection_ratio)` combinations and writes
+`results/probe_single_key.csv`.
 
-## Statistical rigour
+### Parallelism
 
-Identification/verification metrics use repeated `StratifiedGroupKFold` CV over
-`temporal_block_groups` (no adjacent-segment leakage) with Nadeau-Bengio
-corrected CIs; pooled-score EER, `D_↔^sys`, diversity and the leakage gap carry
-percentile-bootstrap CIs; operating points carry Wilson CIs. `--tune` runs a
-group-aware inner CV on each outer fold (nested CV), and `--significance`
-FDR-controls the classifier comparison grid (Benjamini-Hochberg).
+The identification/verification CV respects the `CV_N_JOBS` environment
+variable (default `-1`, all cores).  Set `OMP_NUM_THREADS=1` when parallelising
+at the Python level to avoid nested thread pools and ensure bit-reproducible
+BLAS results.
 
-## Scope & limitations (read before citing numbers)
+```bash
+OMP_NUM_THREADS=1 CV_N_JOBS=8 python scripts/run_experiment.py --all
+```
 
-* **Session structure of the evaluation.** MIMIC-100 is essentially one
-  continuous recording per subject. Group-aware temporal-block CV removes
-  adjacent-segment leakage, but train and test still come from the **same
-  acquisition session**, so the MIMIC-100 headline numbers are an **upper bound
-  on within-session performance**. Two additions widen this: **BIDMC**
-  replicates the protocol on an independent 53-subject cohort, and **PTT-PPG**
-  supports `cross_session_verification` — enrol on one activity, verify probes
-  from another (`sit`→`walk`/`run`). On PTT-PPG the within-activity EER (~0.09)
-  rises to ~0.23 across activities, quantifying the **cross-condition**
-  robustness gap with bootstrap CIs. Caveat: PTT-PPG's activities are recorded
-  in the same visit, so this is *cross-activity / cross-condition* (physiological
-  state change), **not** multi-day template ageing; a true multi-visit
-  cross-session cohort remains the one outstanding external-validation gap.
-* **Non-invertibility is a linear-attack bound.** The reconstructions in
-  `mwf.non_invertibility` are the closed-form min-norm (ECG) /
-  IoM-winner (PPG) inverses — a **lower bound on attacker capability**. A learning-
-  or optimisation-based inversion (e.g. Mai et al. 2019, gradient inversion) can
-  recover more; the leakage figures describe the linear family only. A token-aware
-  IoM inversion still recovers the PPG *direction* with a correlation that grows
-  with code length and window, so the leak cannot reach zero without destroying
-  utility — the operative guarantees are unlinkability, magnitude/exact-preimage
-  non-invertibility, and the key-independence of the IoM similarity.
-* **Hyperparameters.** Fixed classifier configs are reference centres; report
-  `--tune` (nested-CV) numbers when claiming one model beats another, or state
-  that defaults were fixed a priori without data-driven selection on this cohort.
+---
+
+## Key design decisions
+
+**Feature-domain transform.** The cancelable transform acts on the feature
+vector, not the waveform.  This keeps feature extraction token-independent and
+allows arbitrary waveform preprocessing without touching the protection layer.
+
+**Hybrid per-modality protection.** A plain BioHashing projection applied to
+the full ECG‖PPG vector leaks ~√(m/d) of both modalities.  Routing the PPG
+block through IoM replaces that linear leakage path with an angle-only
+similarity measure that has no tractable linear pre-image.  ECG retains
+real-valued BioHashing because its morphological richness benefits from the
+full projection resolution.
+
+**Equal-weight fusion.** Both protected blocks are unit-L2-normalised before
+concatenation, so cosine similarity on the hybrid template weights ECG and PPG
+equally regardless of their raw dimensionalities.
+
+**Group-aware CV.** Segments are temporally correlated within a subject.
+Using subject ID as the group variable in stratified-group k-fold prevents any
+subject's segments from appearing in both train and test within the same fold,
+eliminating identity leakage.
+
+**Honest z-norm.** Score normalisation in the stolen-token and cross-activity
+protocols uses a held-out cohort (subjects disjoint from the victim pool),
+matching operational deployment where impostor statistics are estimated from an
+independent reference set.

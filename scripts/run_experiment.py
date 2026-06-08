@@ -77,6 +77,7 @@ from mwf import (  # noqa: E402
     evaluate,
     evaluate_cancelability,
     extract_features_batch,
+    FeatureScaler,
     load_bidmc,
     load_mimic100,
     load_ptt_ppg,
@@ -509,17 +510,21 @@ def _cancelability_df(
     tokens = _random_tokens(n_keys, seed=seed)
     labels = segments.labels
     n_subjects = max(1, int(np.unique(labels).size))
+    _n_jobs = int(os.environ.get("JOBLIB_N_JOBS", "-1"))
 
     # Build base templates per level (sequential; one BioHashing call per level).
-    bases_by_level: dict[int, tuple[np.ndarray, float, np.ndarray]] = {}
+    # Scaler is fitted once here and forwarded to every token job so the same
+    # normalisation is applied consistently without redundant refitting.
+    bases_by_level: dict[int, tuple[np.ndarray, float, np.ndarray, FeatureScaler]] = {}
     for level in feature_levels:
-        base = _templates_for_token(
-            features_by_level[level], tokens[0], projection_ratio, binarise,
-        )
+        feats = features_by_level[level]
+        scaler = FeatureScaler.fit(feats)
+        base = _templates_for_token(feats, tokens[0], projection_ratio, binarise, scaler=scaler)
         bases_by_level[level] = (
             base,
             _same_key_genuine_mean(base, labels),
             _standardize_columns(base),
+            scaler,
         )
 
     # One job per (level, token) pair — n_levels × (n_keys − 1) total.
@@ -531,8 +536,9 @@ def _cancelability_df(
         base: np.ndarray,
         baseline_mean: float,
         base_z: np.ndarray,
+        scaler: FeatureScaler,
     ) -> tuple:
-        reissued = _templates_for_token(feats, token, projection_ratio, binarise)
+        reissued = _templates_for_token(feats, token, projection_ratio, binarise, scaler=scaler)
         mated, non_mated = genuine_impostor_scores(base, reissued, labels)
         reissued_z = _standardize_columns(reissued)
         diversity = _per_class_abs_corr(base_z, reissued_z, labels)
@@ -543,22 +549,22 @@ def _cancelability_df(
         for level in feature_levels
         for tok in tokens[1:]
     ]
-    n_jobs = len(jobs)
+    n_job_count = len(jobs)
     with parallel_config(backend="loky", inner_max_num_threads=1), \
-            tqdm_joblib(n_jobs, desc="Cancelability"):
-        raw = Parallel(n_jobs=-1)(
-            delayed(_one_token_job)(level, tok, feats, base, bm, bz)
-            for level, tok, feats, base, bm, bz in jobs
+            tqdm_joblib(n_job_count, desc="Cancelability"):
+        raw = Parallel(n_jobs=_n_jobs)(
+            delayed(_one_token_job)(level, tok, feats, base, bm, bz, sc)
+            for level, tok, feats, base, bm, bz, sc in jobs
         )
 
     # Collect per-level arrays in tokens[1:] order (preserved by joblib).
+    # mated scores serve both the renewability CI and the D_sys computation.
     groups: dict[int, dict] = {
-        lv: {"renew": [], "mated": [], "non_mated": [], "div": [], "bm": None}
+        lv: {"mated": [], "non_mated": [], "div": [], "bm": None}
         for lv in feature_levels
     }
     for level, baseline_mean, mated, non_mated, diversity in raw:
         g = groups[level]
-        g["renew"].append(mated)
         g["mated"].append(mated)
         g["non_mated"].append(non_mated)
         g["div"].append(diversity)
@@ -568,9 +574,9 @@ def _cancelability_df(
     for level in feature_levels:
         g = groups[level]
         base_shape = bases_by_level[level][0].shape
-        report = _assemble_cancelability_report(
+        report, _ = _assemble_cancelability_report(
             n_keys=n_keys,
-            renew_per_key=g["renew"],
+            renew_per_key=g["mated"],
             mated_pool=g["mated"],
             non_mated_pool=g["non_mated"],
             diversity_per_key=g["div"],
@@ -961,7 +967,7 @@ def _plot_figures(
         return regime.value, closed_set_score_pools(bundle, n_folds=n_folds)
 
     with parallel_config(backend="loky", inner_max_num_threads=1):
-        regime_results = Parallel(n_jobs=-1)(
+        regime_results = Parallel(n_jobs=int(os.environ.get("JOBLIB_N_JOBS", "-1")))(
             delayed(_regime_pools)(regime) for regime in regimes
         )
     pools: dict[str, tuple[np.ndarray, np.ndarray]] = dict(regime_results)

@@ -47,8 +47,11 @@ def compute_subject_centroids(
     Returns:
         Tuple ``(centroids, subject_ids)`` with one centroid per unique label.
     """
-    uniq = np.unique(labels)
-    centroids = np.stack([features[labels == lab].mean(axis=0) for lab in uniq])
+    uniq, inv = np.unique(labels, return_inverse=True)
+    n_subjects = len(uniq)
+    centroids = np.zeros((n_subjects, features.shape[1]), dtype=np.float64)
+    np.add.at(centroids, inv, features)
+    centroids /= np.bincount(inv, minlength=n_subjects)[:, None]
     return centroids, uniq
 
 

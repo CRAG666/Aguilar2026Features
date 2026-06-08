@@ -188,30 +188,32 @@ def feature_names(
     return names_ecg + names_ppg
 
 
-def _features_chunk(
+def _modal_chunk(
     chunk: NDArray[np.float64],
-    n_samples: int,
+    signal_name: str,
     wavelet: str,
     level: int,
 ) -> NDArray[np.float64]:
-    """Extract features for every row of an ``hstack([ecg, ppg])`` chunk.
+    """Extract single-modality features for every row of a ``(k, N)`` chunk.
 
     Args:
-        chunk: ``(k, 2 * n_samples)`` slab; columns ``[:n_samples]`` are ECG,
-            ``[n_samples:]`` are PPG.
-        n_samples: Per-modality segment length (the split point).
-        wavelet: Forwarded to :func:`extract_features`.
-        level: Forwarded to :func:`extract_features`.
+        chunk: ``(k, N)`` raw signal slab for one modality.
+        signal_name: ``"ECG"`` or ``"PPG"``; forwarded to the shared extractor.
+        wavelet: Forwarded to the shared extractor.
+        level: DWT decomposition depth.
 
     Returns:
-        ``(k, feature_dimension(level))`` array of stacked feature vectors.
+        ``(k, STATS_PER_BAND * (level + 1))`` feature matrix.
     """
-    dim = feature_dimension(level)
+    dim = STATS_PER_BAND * (level + 1)
     out = np.empty((chunk.shape[0], dim), dtype=np.float64)
     for row in range(chunk.shape[0]):
-        ecg_row = chunk[row, :n_samples]
-        ppg_row = chunk[row, n_samples:]
-        out[row] = extract_features(ecg_row, ppg_row, wavelet=wavelet, level=level)
+        feats = extract_wavelet_features(
+            _as_writable_float64(chunk[row]), signal_name,
+            wavelet=wavelet, level=level,
+        )
+        values = np.fromiter(feats.values(), dtype=np.float64, count=dim)
+        out[row] = np.nan_to_num(values, nan=0.0, posinf=_POSINF, neginf=_NEGINF)
     return out
 
 
@@ -224,15 +226,19 @@ def extract_features_batch(
 ) -> NDArray[np.float64]:
     """Extract multimodal features for every segment of a ``(B, N)`` batch.
 
+    Each modality is processed independently through its own parallel pipeline
+    and the resulting feature blocks are concatenated — no raw-signal hstack.
+
     Args:
         ecg: ``(B, N)`` float64 ECG batch.
         ppg: ``(B, N)`` float64 PPG batch aligned with ``ecg``.
-        wavelet: Forwarded to :func:`extract_features`.
+        wavelet: Forwarded to the shared extractor.
         level: DWT decomposition depth (must be ≥ 1).
         n_jobs: Worker count forwarded to :func:`parallel_row_map`.
 
     Returns:
-        ``(B, feature_dimension(level))`` array in input row order.
+        ``(B, feature_dimension(level))`` array in input row order
+        (ECG feature block first, then PPG).
 
     Raises:
         ValueError: If ``ecg``/``ppg`` are not 2-D or have mismatched shapes.
@@ -242,13 +248,15 @@ def extract_features_batch(
     if ecg.shape != ppg.shape:
         raise ValueError(f"Shape mismatch: ECG {ecg.shape} vs PPG {ppg.shape}.")
 
-    n_samples = ecg.shape[1]
-    stacked = np.hstack([ecg, ppg])
+    def _ecg_worker(chunk: NDArray[np.float64]) -> NDArray[np.float64]:
+        return _modal_chunk(chunk, _SIGNAL_NAMES[0], wavelet, level)
 
-    def _worker(chunk: NDArray[np.float64]) -> NDArray[np.float64]:
-        return _features_chunk(chunk, n_samples, wavelet, level)
+    def _ppg_worker(chunk: NDArray[np.float64]) -> NDArray[np.float64]:
+        return _modal_chunk(chunk, _SIGNAL_NAMES[1], wavelet, level)
 
-    return parallel_row_map(stacked, _worker, n_jobs=n_jobs)
+    ecg_feats = parallel_row_map(ecg, _ecg_worker, n_jobs=n_jobs)
+    ppg_feats = parallel_row_map(ppg, _ppg_worker, n_jobs=n_jobs)
+    return np.hstack([ecg_feats, ppg_feats])
 
 
 __all__ = [

@@ -74,26 +74,6 @@ class CrossSessionResult:
     operating_points: dict[str, float]
 
 
-def _split_impostor_cohort(
-    other_idx: NDArray[np.int64],
-    labels: NDArray[np.int64],
-    rng: np.random.Generator,
-) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-    """Split impostor probe indices into a Z-norm cohort and a disjoint scored set.
-
-    Splits by subject so the cohort estimating the normalisation statistics
-    shares no identity with the impostors they are applied to.
-    """
-    other_subjects = np.unique(labels[other_idx])
-    if other_subjects.size < 2:
-        return other_idx, other_idx
-    perm = rng.permutation(other_subjects.size)
-    n_cohort = max(1, other_subjects.size // 2)
-    cohort_subjects = other_subjects[perm[:n_cohort]]
-    in_cohort = np.isin(labels[other_idx], cohort_subjects)
-    return other_idx[in_cohort], other_idx[~in_cohort]
-
-
 def _features(
     segments: BiometricSegments,
     *,
