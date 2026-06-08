@@ -12,8 +12,10 @@
 # 3x21 cores fijos a datasets desiguales (MIMIC estrangulado, BIDMC/PTT ociosos)
 # y, peor aún, sus tres procesos separados NO pueden compartir el pool.
 #
-# NO se pide --gres: la carga es sklearn-CPU; las A100 no la aceleran (datos
-# pequeños + sklearn no usa GPU) y son recurso escaso del nodo compartido.
+# Se pide --gres=gpu:1 para el path CuPy de _reconstruct_chunk_gpu
+# (non_invertibility.py): QR por lotes + GEMMs en A100 vs N QR secuenciales CPU.
+# La carga principal (CV sklearn) no usa GPU; el overhead de reservar la tarjeta
+# es mínimo frente al tiempo de reconstrucción con la cohorte completa.
 #
 # Envío:
 #     sbatch scripts/run_slurm.sh
@@ -30,6 +32,7 @@
 #SBATCH --ntasks=1                           # Un proceso: el pool plano vive dentro
 #SBATCH --cpus-per-task=64                   # 64 <= 70 cores; deja margen al nodo compartido
 #SBATCH --mem=160G                           # Holgado: 3 cohortes chicas en RAM <= 160 << 411 GB
+#SBATCH --gres=gpu:1                         # 1 A100 para _reconstruct_chunk_gpu
 #SBATCH --time=2-00:00:00                    # Límite generoso (la cola es INFINITE)
 #SBATCH --output=logs/run_%j.out             # stdout (%j = job id)
 #SBATCH --error=logs/run_%j.err              # stderr
@@ -84,8 +87,15 @@ echo "Memmap temp:     $JOBLIB_TEMP_FOLDER"
 echo "Inicio:          $(date)"
 echo "==================================================================="
 
+# --- GPU visible para CuPy ---------------------------------------------------
+# Restringir a la tarjeta asignada por SLURM; si no se exporta, CuPy ve todas.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
 # --- Entorno con uv (idempotente) -------------------------------------------
 uv sync --frozen
+# CuPy no está en el lockfile (el wheel depende del driver CUDA del nodo).
+# uv pip install es idempotente y no toca el lockfile de los deps base.
+uv pip install cupy-cuda12x
 
 # --- Batería completa: los 3 datasets en un pool compartido -----------------
 uv run python scripts/run_experiment.py --datasets all --all --tune \

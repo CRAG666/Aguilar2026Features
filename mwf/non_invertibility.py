@@ -66,8 +66,15 @@ from .feature_transform import (
 )
 from .features import extract_features_batch
 from .pipeline import _token_for_label, preprocess_signals
+from .keystream import keystream_rng
 from .rng import make_rng
 from .scoring import cosine_score_matrix, l2_normalise
+
+try:
+    import cupy as _cupy
+    _CUPY_AVAILABLE = True
+except ImportError:
+    _CUPY_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +82,7 @@ DEFAULT_NON_MATED_PAIRS_PER_VICTIM: Final[int] = 8
 _GAP_BOOTSTRAP_RESAMPLES: Final[int] = 1000
 _GAP_BOOTSTRAP_LEVEL: Final[float] = 0.95
 _RECONSTRUCT_PARALLEL_THRESHOLD: Final[int] = 64
+_GPU_THRESHOLD: Final[int] = 128  # min samples where PCIe round-trip is amortised
 
 
 def _batch_abs_pearsonr(
@@ -258,6 +266,8 @@ def _reconstruct_features(
     # out across cores in contiguous chunks and the concatenation reproduces the
     # sequential output exactly. Deriving a fresh projection matrix per row makes
     # this the dominant cost of the whole non-invertibility report.
+    if _CUPY_AVAILABLE and n >= _GPU_THRESHOLD:
+        return _reconstruct_chunk_gpu(features, tokens, half, m_ecg, n_hashes, window)
     n_jobs = DEFAULT_BATCH_N_JOBS
     if n_jobs == 1 or n < _RECONSTRUCT_PARALLEL_THRESHOLD:
         return _reconstruct_chunk(features, tokens, half, m_ecg, n_hashes, window)
@@ -296,6 +306,62 @@ def _reconstruct_chunk(
         out[i, :half] = r_ecg.T @ y_ecg
         out[i, half:] = recover_ppg_iom(ppg, token + PPG_SALT, n_hashes, window)
     return out
+
+
+def _reconstruct_chunk_gpu(
+    features: NDArray[np.float64],
+    tokens: list[str],
+    half: int,
+    m_ecg: int,
+    n_hashes: int,
+    window: int,
+) -> NDArray[np.float64]:
+    """GPU-accelerated (CuPy) reconstruction for a full sample batch.
+
+    Per-token SHA-256 seeds mean each Gaussian matrix must be drawn on CPU;
+    the savings come from replacing N sequential QR + matmul calls with a
+    single cuSOLVER batched QR and two cuBLAS batched GEMMs on the A100.
+
+    The PPG path also eliminates the redundant second Gaussian draw that
+    :func:`recover_ppg_iom` incurs via :func:`~mwf.iom.iom_indices`.
+    """
+    import cupy as cp
+
+    n = features.shape[0]
+
+    # --- CPU: generate per-token Gaussians (different SHA-256 seed per row) ---
+    ecg_g = np.empty((n, half, m_ecg), dtype=np.float64)
+    ppg_g = np.empty((n, n_hashes, window, half), dtype=np.float64)
+    for i, token in enumerate(tokens):
+        ecg_g[i] = keystream_rng(token + ECG_SALT).standard_normal((half, m_ecg))
+        ppg_g[i] = keystream_rng(token + PPG_SALT).standard_normal((n_hashes, window, half))
+
+    # --- GPU: transfer once, compute everything on device ---
+    g_ecg = cp.asarray(ecg_g)                       # (n, half, m)
+    g_ppg = cp.asarray(ppg_g)                       # (n, H, q, half)
+    feat  = cp.asarray(features)                    # (n, 2*half)
+    ecg_feat = feat[:, :half]                       # (n, half)
+    ppg_feat = feat[:, half:]                       # (n, half)
+
+    # ECG: batched QR via cuSOLVER → Q (n, half, m); then Rᵀy = Q(Qᵀ ecg).
+    Q, _ = cp.linalg.qr(g_ecg, mode="reduced")     # Q: (n, half, m)
+    Qt   = Q.transpose(0, 2, 1)                     # (n, m, half)
+    y    = cp.matmul(Qt, ecg_feat[:, :, None]).squeeze(-1)   # (n, m)
+    recon_ecg = cp.matmul(Q, y[:, :, None]).squeeze(-1)      # (n, half)
+
+    # PPG: batched projection via cuBLAS GEMM, argmax, winner-direction sum.
+    # Reshape to (n, H*q, half) so a single batched GEMM covers all hashes.
+    flat_ppg = g_ppg.reshape(n, n_hashes * window, half)     # (n, H*q, half)
+    proj_flat = cp.matmul(flat_ppg, ppg_feat[:, :, None]).squeeze(-1)  # (n, H*q)
+    proj = proj_flat.reshape(n, n_hashes, window)            # (n, H, q)
+    idx  = proj.argmax(axis=2)                               # (n, H)
+
+    n_idx = cp.arange(n)[:, None]                           # broadcast (n, 1)
+    h_idx = cp.arange(n_hashes)[None, :]                    # broadcast (1, H)
+    winners  = g_ppg[n_idx, h_idx, idx]                     # (n, H, half)
+    recon_ppg = winners.sum(axis=1)                          # (n, half)
+
+    return cp.asnumpy(cp.concatenate([recon_ecg, recon_ppg], axis=1))
 
 
 def _correlation_pools(

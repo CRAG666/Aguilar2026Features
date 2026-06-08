@@ -49,6 +49,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest==9.0.3"]
+gpu = ["cupy-cuda12x"]  # optional; activates GPU path in non_invertibility.py
 
 [build-system]
 requires = ["hatchling>=1.18"]
