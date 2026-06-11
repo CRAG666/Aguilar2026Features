@@ -380,7 +380,7 @@ def class_score_matrix(
     proba = getattr(estimator, "predict_proba", None)
     if proba is not None:
         return np.asarray(proba(x), dtype=np.float64)
-    decision = getattr(estimator, "decision_function")
+    decision = estimator.decision_function
     scores = np.asarray(decision(x), dtype=np.float64)
     if scores.ndim == 1:  # binary one-vs-rest → two class-aligned columns
         scores = np.column_stack([-scores, scores])
@@ -699,7 +699,7 @@ def _evaluate_fold_jobs(
         )
     # Un-permute: restore input order so callers see schedule-independent output.
     indices = (idx for idx, _job in ordered)
-    return [r for _, r in sorted(zip(indices, dispatched), key=lambda t: t[0])]
+    return [r for _, r in sorted(zip(indices, dispatched, strict=True), key=lambda t: t[0])]
 
 
 def cross_validate_classifier_multiseed(
@@ -938,7 +938,7 @@ def cross_validate_tasks(
             task.classifier_name, task.bundle, list(islice(evals, count)),
             n_folds_per_seed=n_folds, n_split_seeds=len(split_seeds),
         )
-        for task, count in zip(tasks, fold_counts)
+        for task, count in zip(tasks, fold_counts, strict=True)
     ]
 
 

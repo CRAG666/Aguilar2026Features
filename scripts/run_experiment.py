@@ -75,7 +75,6 @@ from mwf import (  # noqa: E402
     decidability,
     det_curve_from_scores,
     evaluate,
-    evaluate_cancelability,
     extract_features_batch,
     FeatureScaler,
     load_bidmc,
@@ -441,7 +440,7 @@ def _assemble_identification(
     """
     id_rows: list[dict] = []
     id_results: dict[str, dict[str, CrossValidationResult]] = {}
-    for task, result in zip(tasks, results):
+    for task, result in zip(tasks, results, strict=True):
         regime, level, name = cast(tuple[KeyMode, int, str], task.key)
         id_results.setdefault(f"{regime.value}@L{level}", {})[name] = result
         id_rows.append(
@@ -477,7 +476,7 @@ def _verification_df(
     )
     return pd.DataFrame([
         _verification_metric_row(regime.value, level, mode, ver, n_folds=n_folds)
-        for (regime, level, mode), ver in zip(ver_keys, vers)
+        for (regime, level, mode), ver in zip(ver_keys, vers, strict=True)
     ])
 
 
@@ -500,8 +499,6 @@ def _cancelability_df(
     the bootstrap CIs run sequentially on the collected arrays.  CSVs are
     byte-identical to the old sequential implementation under OMP=1.
     """
-    from collections import defaultdict
-
     from joblib import Parallel, delayed, parallel_config
     from mwf.progress import tqdm_joblib
 
@@ -1380,7 +1377,7 @@ def main(argv: list[str] | None = None) -> None:
         loaded_segments = list(pool.map(_load_one, specs))
 
     works = []
-    for spec, segments in track(zip(specs, loaded_segments), desc="Building templates", total=len(specs)):
+    for spec, segments in track(zip(specs, loaded_segments, strict=True), desc="Building templates", total=len(specs)):
         works.append(
             _prepare_dataset(
                 spec, segments,
