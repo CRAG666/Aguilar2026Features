@@ -60,19 +60,6 @@ def bootstrap_ci_mean(
     return float(res.confidence_interval.low), float(res.confidence_interval.high)
 
 
-def _nadeau_bengio_test_train_ratio(n_folds: int) -> float:
-    """Return ``n_test / n_train`` for one fold of ``n_folds``-fold CV.
-
-    Args:
-        n_folds: Folds per CV repetition (the ``k`` in k-fold).
-
-    Returns:
-        ``1 / (n_folds - 1)`` — the held-out fraction over the trained-on
-        fraction for a single fold.
-    """
-    return 1.0 / (n_folds - 1)
-
-
 def nadeau_bengio_ci_mean(
     samples: NDArray[np.float64],
     *,
@@ -102,9 +89,8 @@ def nadeau_bengio_ci_mean(
         return float("nan"), float("nan")
     mean = float(samples.mean())
     var = float(samples.var(ddof=1))
-    corrected_se = math.sqrt(
-        max(var, 0.0) * (1.0 / j + _nadeau_bengio_test_train_ratio(n_folds))
-    )
+    # n_test/n_train = 1/(n_folds - 1) for k-fold CV (Nadeau & Bengio, 2003).
+    corrected_se = math.sqrt(max(var, 0.0) * (1.0 / j + 1.0 / (n_folds - 1)))
     half = float(_student_t.ppf(0.5 + level / 2.0, df=j - 1)) * corrected_se
     return mean - half, mean + half
 
@@ -139,9 +125,8 @@ def nadeau_bengio_paired_t(
     var_d = float(d.var(ddof=1))
     if var_d == 0.0:
         return float("nan"), float("nan")
-    corrected_se = math.sqrt(
-        var_d * (1.0 / j + _nadeau_bengio_test_train_ratio(n_folds))
-    )
+    # n_test/n_train = 1/(n_folds - 1) for k-fold CV (Nadeau & Bengio, 2003).
+    corrected_se = math.sqrt(var_d * (1.0 / j + 1.0 / (n_folds - 1)))
     t_stat = float(d.mean()) / corrected_se
     p_value = float(2.0 * _student_t.sf(abs(t_stat), df=j - 1))
     return float(t_stat), p_value

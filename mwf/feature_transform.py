@@ -46,6 +46,7 @@ from .constants import (
     IOM_WINDOW,
 )
 from .keystream import keystream_rng
+from .scoring import l2_normalise
 
 DEFAULT_RATIO: Final[float] = DEFAULT_PROJECTION_RATIO
 MIN_OUT_DIM: Final[int] = 1
@@ -210,12 +211,6 @@ def _apply(matrix: NDArray[np.float64], x: NDArray[np.float64], binarise: bool) 
 # rate directly).
 
 
-def _l2_rows(a: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Unit-L2-normalise each row, leaving all-zero rows untouched."""
-    norms = np.linalg.norm(a, axis=1, keepdims=True)
-    return a / np.where(norms > 0.0, norms, 1.0)
-
-
 def _split_modalities(d: int) -> int:
     """Return the ECG/PPG split point for a length-``d`` multimodal vector.
 
@@ -294,7 +289,7 @@ def transform_multimodal(
     m_ecg = projection_dim(half, projection_ratio)
     ecg_key = derive_projection(token + ECG_SALT, half, m_ecg)
     ecg_t = _apply(ecg_key.matrix, ecg, binarise)
-    ecg_t = _l2_rows(ecg_t[np.newaxis, :])[0]
+    ecg_t = l2_normalise(ecg_t[np.newaxis, :])[0]
 
     n_hashes = iom.hash_count(half, n_hashes_ratio)
     ppg_t = iom.iom_onehot(ppg, token + PPG_SALT, n_hashes, window, normalise=True)
@@ -363,7 +358,7 @@ def transform_multimodal_batch(
         ecg_t = ecg_block @ ecg_key.matrix.T
         if binarise:
             ecg_t = np.where(ecg_t >= 0.0, 1.0, -1.0)
-        ecg_t = _l2_rows(ecg_t)
+        ecg_t = l2_normalise(ecg_t)
 
         ppg_t = iom.iom_onehot(ppg_block, token + PPG_SALT, n_hashes, window, normalise=True)
         out[rows] = np.concatenate([ecg_t, ppg_t], axis=1)

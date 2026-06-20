@@ -40,7 +40,6 @@ from typing import Final
 import numpy as np
 from joblib import Parallel, delayed, parallel_config
 from numpy.typing import NDArray
-from scipy.stats import pearsonr
 
 from . import iom
 from .batch_utils import DEFAULT_BATCH_N_JOBS
@@ -90,8 +89,7 @@ def _batch_abs_pearsonr(
 ) -> NDArray[np.float64]:
     """Per-row |Pearson r| between matching rows of A and B.
 
-    Vectorised replacement for a Python loop calling :func:`_safe_corr` on
-    individual pairs.  Constant rows (zero variance) return ``0.0``.
+    Constant rows (zero variance) return ``0.0``.
 
     Args:
         A: ``(n, d)`` matrix.
@@ -106,22 +104,6 @@ def _batch_abs_pearsonr(
     valid = denom > 0
     r = np.where(valid, (A_c * B_c).sum(axis=1) / np.where(valid, denom, 1.0), 0.0)
     return np.abs(r)
-
-
-def _safe_corr(a: NDArray[np.float64], b: NDArray[np.float64]) -> float:
-    """Return ``pearsonr(a, b)``, mapping the degenerate (constant) case to 0.
-
-    Args:
-        a: First 1-D vector.
-        b: Second 1-D vector of equal length.
-
-    Returns:
-        Pearson correlation, or ``0.0`` when either vector is constant.
-    """
-    if a.size < 2 or float(np.std(a)) == 0.0 or float(np.std(b)) == 0.0:
-        return 0.0
-    r, _ = pearsonr(a, b)
-    return float(0.0 if np.isnan(r) else r)
 
 
 def recover_ppg_iom(
@@ -419,23 +401,6 @@ def _eer_threshold(
     idx = int(np.argmin(np.abs(det.fmr - det.fnmr)))
     eer = float(0.5 * (det.fmr[idx] + det.fnmr[idx]))
     return eer, float(det.thresholds[idx])
-
-
-def _attack_pairs(
-    templates: NDArray[np.float64],
-    labels: NDArray[np.int64],
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Off-diagonal cosine genuine / impostor scores for a template matrix.
-
-    The diagonal (a template scored against itself) is excluded from *both*
-    pools — a cosine ``= 1`` self-match would inflate the impostor tail and
-    skew the EER threshold downstream.
-    """
-    sim = cosine_score_matrix(templates, templates)
-    same = labels[:, None] == labels[None, :]
-    np.fill_diagonal(same, False)
-    off_diagonal = ~np.eye(labels.size, dtype=bool)
-    return sim[same], sim[~same & off_diagonal]
 
 
 def _centroid_attack_pairs(

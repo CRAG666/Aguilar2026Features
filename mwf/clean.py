@@ -51,14 +51,11 @@ def _validate(signal: NDArray[np.float64], sampling_rate: int) -> None:
 # NeuroKit cleaners share one signature ``(signal, sampling_rate=, method=)`` and
 # one calling convention (suppress their chatty warnings, coerce to float64). Their
 # stubbed return is loose, so ``_clean_one`` coerces the result with ``np.asarray``.
-_NkCleaner = Callable[..., Any]
-
-
 def _clean_one(
     signal: NDArray[np.float64],
     sampling_rate: int,
     method: str,
-    cleaner: _NkCleaner,
+    cleaner: Callable[..., Any],
 ) -> NDArray[np.float64]:
     """Validate, then run one NeuroKit cleaner with warnings suppressed."""
     _validate(signal, sampling_rate)
@@ -114,28 +111,6 @@ def clean_ppg(
     return _clean_one(signal, sampling_rate, method, nk.ppg_clean)
 
 
-def _clean_chunk(
-    chunk: NDArray[np.float64],
-    clean_one,
-    sampling_rate: int,
-    method: str,
-) -> NDArray[np.float64]:
-    """Apply a single-segment cleaner to every row of a slab.
-
-    Args:
-        chunk: ``(k, N)`` slab.
-        clean_one: :func:`clean_ecg` or :func:`clean_ppg`.
-        sampling_rate: Forwarded to ``clean_one``.
-        method: Forwarded to ``clean_one``.
-
-    Returns:
-        ``(k, N)`` cleaned array in input row order.
-    """
-    return np.stack([
-        clean_one(row, sampling_rate, method) for row in chunk
-    ])
-
-
 def _clean_batch(
     signals: NDArray[np.float64],
     clean_one: Callable[..., NDArray[np.float64]],
@@ -147,7 +122,7 @@ def _clean_batch(
     ensure_2d_batch(signals, name="signals")
 
     def _worker(chunk: NDArray[np.float64]) -> NDArray[np.float64]:
-        return _clean_chunk(chunk, clean_one, sampling_rate, method)
+        return np.stack([clean_one(row, sampling_rate, method) for row in chunk])
 
     return parallel_row_map(signals, _worker, n_jobs=n_jobs)
 

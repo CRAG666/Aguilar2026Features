@@ -387,10 +387,6 @@ def class_score_matrix(
     return scores
 
 
-# Backwards-compatible private alias for the in-module call sites.
-_score_matrix = class_score_matrix
-
-
 DEFAULT_INNER_FOLDS: Final[int] = 3
 DEFAULT_TUNE_SCORING: Final[str] = "f1_macro"
 
@@ -560,7 +556,7 @@ def _fit_fold(
     else:
         estimator.fit(x_train, y_train)
     y_pred = np.asarray(estimator.predict(x_test), dtype=np.int64)
-    y_score = _score_matrix(estimator, x_test)
+    y_score = class_score_matrix(estimator, x_test)
     # ``.classes_`` is exposed by both Pipeline (via the final step) and
     # GridSearchCV (via the refit best estimator), so it works for either path.
     classes = np.asarray(estimator.classes_, dtype=np.int64)

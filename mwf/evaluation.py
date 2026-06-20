@@ -28,8 +28,6 @@ from .stats_helpers import bootstrap_ci_mean, nadeau_bengio_ci_mean, std_or_zero
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BOOTSTRAP_RESAMPLES: Final[int] = BOOTSTRAP_RESAMPLES_EVAL
-DEFAULT_CI_LEVEL: Final[float] = BOOTSTRAP_CI_LEVEL
 DEFAULT_GLOBAL_SEED: Final[int] = DEFAULT_SEED
 
 METRIC_NAMES: Final[tuple[str, ...]] = (
@@ -133,8 +131,8 @@ class MetricSummary:
 
 def summarise(
     name: str, values: Sequence[float] | NDArray[np.float64],
-    n_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
-    ci_level: float = DEFAULT_CI_LEVEL,
+    n_resamples: int = BOOTSTRAP_RESAMPLES_EVAL,
+    ci_level: float = BOOTSTRAP_CI_LEVEL,
     seed: int = DEFAULT_GLOBAL_SEED,
     n_folds: int | None = None,
 ) -> MetricSummary:
@@ -177,8 +175,8 @@ def summarise(
 
 def summarise_run(
     result: CrossValidationResult,
-    n_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
-    ci_level: float = DEFAULT_CI_LEVEL,
+    n_resamples: int = BOOTSTRAP_RESAMPLES_EVAL,
+    ci_level: float = BOOTSTRAP_CI_LEVEL,
     seed: int = DEFAULT_GLOBAL_SEED,
 ) -> dict[str, MetricSummary]:
     """Summarise every metric of a CV run.

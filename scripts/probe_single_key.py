@@ -92,15 +92,11 @@ def _cv_accuracy(X, y, kind, proj, clf) -> tuple[float, float]:
     splitter = stratified_group_splitter(n_splits=N_FOLDS, random_state=SEED)
     accs = []
     for tr, te in splitter.split(X, y, groups=groups):
-        pipe = _make_pipe(kind, clone_proj(proj), clone(clf))
+        # proj is a stateless FunctionTransformer (closure) — reused as-is, not cloned.
+        pipe = _make_pipe(kind, proj, clone(clf))
         pipe.fit(X[tr], y[tr])
         accs.append(float((pipe.predict(X[te]) == y[te]).mean()))
     return float(np.mean(accs)), float(np.std(accs, ddof=1))
-
-
-def clone_proj(proj):
-    # FunctionTransformer holds a closure; cloning is fine (stateless).
-    return proj
 
 
 def main() -> None:

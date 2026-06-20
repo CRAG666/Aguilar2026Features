@@ -136,29 +136,6 @@ def iom_indices(
     return idx[0] if single else idx
 
 
-def _onehot(idx: NDArray[np.int64], window: int, normalise: bool) -> NDArray[np.float64]:
-    """One-hot expand a ``(B, m)`` index code to ``(B, m*q)``.
-
-    Args:
-        idx: ``(B, m)`` integer indices in ``[0, window)``.
-        window: ``q``; width of each indicator block.
-        normalise: If ``True``, scale so each row has unit L2 norm (then the
-            inner product of two rows equals their IoM collision *rate*).
-
-    Returns:
-        ``(B, m * window)`` one-hot code.
-    """
-    b, m = idx.shape
-    code = np.zeros((b, m, window), dtype=np.float64)
-    rows = np.arange(b)[:, None]
-    cols = np.arange(m)[None, :]
-    code[rows, cols, idx] = 1.0
-    code = code.reshape(b, m * window)
-    if normalise:
-        code /= np.sqrt(float(m))
-    return code
-
-
 def iom_onehot(
     features: NDArray[np.float64],
     token: str,
@@ -184,7 +161,12 @@ def iom_onehot(
     idx = iom_indices(x, token, n_hashes, window)
     if single:
         idx = idx[np.newaxis, :]
-    code = _onehot(idx, window, normalise)
+    b, m = idx.shape
+    code = np.zeros((b, m, window), dtype=np.float64)
+    code[np.arange(b)[:, None], np.arange(m)[None, :], idx] = 1.0
+    code = code.reshape(b, m * window)
+    if normalise:  # unit L2 per row → row inner product equals collision rate
+        code /= np.sqrt(float(m))
     return code[0] if single else code
 
 

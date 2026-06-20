@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 from numpy.typing import NDArray
 from pyeer.eer_stats import get_decidability_value
@@ -119,6 +121,44 @@ def znorm(
     return (scores - mu) / sd if sd > 0.0 else scores - mu
 
 
+def znorm_impostor_split(
+    gen: NDArray[np.float64],
+    score_fn: Callable[[NDArray[np.int64]], NDArray[np.float64]],
+    other_idx: NDArray[np.int64],
+    other_labels: NDArray[np.int64],
+    cohort_perm: NDArray[np.int64] | None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Z-norm a probe's genuine/impostor scores against a disjoint cohort.
+
+    Shared by the stolen-token and cross-session protocols, which build the same
+    cohort split over different score pools. ``score_fn(idx)`` returns the cosine
+    scores of rows ``idx`` against the victim centroid. When a by-subject cohort
+    can be formed (``cohort_perm`` given and ≥ 2 other subjects) both pools are
+    z-normalised against it; otherwise raw scores are returned — self-normalising
+    against the scored impostors would deflate the EER by construction.
+
+    Args:
+        gen: Genuine scores for this victim.
+        score_fn: Maps a row-index array to cosine scores against the centroid.
+        other_idx: Indices of all non-victim rows.
+        other_labels: Subject labels aligned with the rows ``score_fn`` indexes.
+        cohort_perm: Pre-generated permutation of the non-victim subjects, or
+            ``None`` when no disjoint cohort is possible.
+
+    Returns:
+        ``(genuine, impostor)`` scores, z-normalised when a cohort was formed.
+    """
+    other_subjects = np.unique(other_labels[other_idx])
+    if cohort_perm is not None and other_subjects.size >= 2:
+        n_cohort = max(1, other_subjects.size // 2)
+        cohort_subjects = other_subjects[cohort_perm[:n_cohort]]
+        in_cohort = np.isin(other_labels[other_idx], cohort_subjects)
+        cohort_scores = score_fn(other_idx[in_cohort])
+        imp = score_fn(other_idx[~in_cohort])
+        return znorm(gen, cohort_scores), znorm(imp, cohort_scores)
+    return gen, score_fn(other_idx)
+
+
 def decidability(
     genuine: NDArray[np.float64], impostor: NDArray[np.float64]
 ) -> float:
@@ -151,4 +191,5 @@ __all__ = [
     "genuine_impostor_split",
     "l2_normalise",
     "znorm",
+    "znorm_impostor_split",
 ]

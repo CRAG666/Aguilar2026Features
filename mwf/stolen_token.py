@@ -48,7 +48,12 @@ from .features import extract_features_batch
 from .operating_curves import bootstrap_eer_ci, operating_points
 from .pipeline import _token_for_label, preprocess_signals
 from .rng import make_rng
-from .scoring import compute_subject_centroids, cosine_score_matrix, l2_normalise, znorm
+from .scoring import (
+    compute_subject_centroids,
+    cosine_score_matrix,
+    l2_normalise,
+    znorm_impostor_split,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -224,28 +229,16 @@ def stolen_token_score_pools(
         enrol_idx = victim_idx[perm[:n_enrol]]
         query_idx = victim_idx[perm[n_enrol:]]
         centroid, _ = compute_subject_centroids(feats_n[enrol_idx], labels[enrol_idx])
-        gen = cosine_score_matrix(feats_n[query_idx], centroid).ravel()
+
+        def score_fn(idx: np.ndarray) -> np.ndarray:
+            return cosine_score_matrix(feats_n[idx], centroid).ravel()
+
+        gen = score_fn(query_idx)
         other_idx = np.flatnonzero(labels != victim)
         if score_norm == "znorm":
-            # Z-norm: split impostors into a held-out cohort (μ/σ) and a scored
-            # set using the pre-generated permutation — disjoint by subject.
-            other_subjects = np.unique(labels[other_idx])
-            if cohort_perm is not None and other_subjects.size >= 2:
-                n_cohort = max(1, other_subjects.size // 2)
-                cohort_subjects = other_subjects[cohort_perm[:n_cohort]]
-                in_cohort = np.isin(labels[other_idx], cohort_subjects)
-                c_idx = other_idx[in_cohort]
-                s_idx = other_idx[~in_cohort]
-                cohort_scores = cosine_score_matrix(feats_n[c_idx], centroid).ravel()
-                imp = cosine_score_matrix(feats_n[s_idx], centroid).ravel()
-                gen, imp = znorm(gen, cohort_scores), znorm(imp, cohort_scores)
-            else:
-                # Only 1 non-victim subject — a disjoint z-norm cohort is impossible.
-                # Normalising against the scored impostors themselves would deflate
-                # the EER by construction, so fall back to raw scores for this victim.
-                imp = cosine_score_matrix(feats_n[other_idx], centroid).ravel()
+            gen, imp = znorm_impostor_split(gen, score_fn, other_idx, labels, cohort_perm)
         else:
-            imp = cosine_score_matrix(feats_n[other_idx], centroid).ravel()
+            imp = score_fn(other_idx)
         return gen, imp
 
     if not valid_uniq:

@@ -34,7 +34,12 @@ from .features import extract_features_batch
 from .operating_curves import bootstrap_eer_ci, operating_points
 from .pipeline import _token_for_label, preprocess_signals
 from .rng import make_rng
-from .scoring import compute_subject_centroids, cosine_score_matrix, l2_normalise, znorm
+from .scoring import (
+    compute_subject_centroids,
+    cosine_score_matrix,
+    l2_normalise,
+    znorm_impostor_split,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -205,26 +210,16 @@ def cross_session_score_pools(
         )
         probe_n = l2_normalise(probe_templates)
 
+        def score_fn(idx: np.ndarray) -> np.ndarray:
+            return cosine_score_matrix(probe_n[idx], centroid).ravel()
+
         victim_probe = np.flatnonzero(probe_labels == victim)
         other_probe = np.flatnonzero(probe_labels != victim)
-        gen = cosine_score_matrix(probe_n[victim_probe], centroid).ravel()
+        gen = score_fn(victim_probe)
         if score_norm == "znorm":
-            other_subjects = np.unique(probe_labels[other_probe])
-            if cohort_perm is not None and other_subjects.size >= 2:
-                n_cohort = max(1, other_subjects.size // 2)
-                cohort_subjects = other_subjects[cohort_perm[:n_cohort]]
-                in_cohort = np.isin(probe_labels[other_probe], cohort_subjects)
-                c_idx = other_probe[in_cohort]
-                s_idx = other_probe[~in_cohort]
-                cohort_scores = cosine_score_matrix(probe_n[c_idx], centroid).ravel()
-                imp = cosine_score_matrix(probe_n[s_idx], centroid).ravel()
-                gen, imp = znorm(gen, cohort_scores), znorm(imp, cohort_scores)
-            else:
-                # Only 1 non-victim subject — a disjoint z-norm cohort is impossible.
-                # Self-normalisation would deflate EER by construction; use raw scores.
-                imp = cosine_score_matrix(probe_n[other_probe], centroid).ravel()
+            gen, imp = znorm_impostor_split(gen, score_fn, other_probe, probe_labels, cohort_perm)
         else:
-            imp = cosine_score_matrix(probe_n[other_probe], centroid).ravel()
+            imp = score_fn(other_probe)
         return gen, imp
 
     if not valid_common:
